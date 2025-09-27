@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "ssh_connect",
+      "ssh_disconnect",
+      "ssh_download_file",
+      "ssh_execute",
+      "ssh_health_check",
+      "ssh_list_connections",
+      "ssh_upload_file"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

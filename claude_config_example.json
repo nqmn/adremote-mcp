@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "ssh-remote": {
+      "command": "C:\\Users\\Intel\\Desktop\\adremote-mcp\\venv\\Scripts\\python.exe",
+      "args": ["C:\\Users\\Intel\\Desktop\\adremote-mcp\\ssh_mcp_server.py"]
+    },
+    "sequential-thinking": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-sequential-thinking"
+      ]
+    }
+  }
+}

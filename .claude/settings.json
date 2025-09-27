@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "ssh_connect",
+      "ssh_execute",
+      "ssh_upload_file",
+      "ssh_download_file",
+      "ssh_health_check",
+      "ssh_list_connections",
+      "ssh_disconnect"
+    ]
+  }
+}
