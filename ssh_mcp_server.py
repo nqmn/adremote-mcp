@@ -252,7 +252,7 @@ class SSHMCPServer:
 
                 # Try different key types
                 key = None
-                for key_class in [paramiko.RSAKey, paramiko.DSAKey, paramiko.ECDSAKey, paramiko.Ed25519Key]:
+                for key_class in [paramiko.RSAKey, paramiko.ECDSAKey, paramiko.Ed25519Key]:
                     try:
                         key = key_class.from_private_key_file(str(private_key_path))
                         break
