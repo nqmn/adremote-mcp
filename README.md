@@ -11,11 +11,21 @@ SSH remote access for MCP-compatible clients through Model Context Protocol (MCP
 
 2. **Add the MCP in Claude Desktop or Claude Code**:
 
-   Use your MCP config and point it to `ssh_mcp_server.py`.
+   Use your MCP config and set the command to:
+   ```bash
+   python3 adremote-mcp/ssh_mcp_server.py
+   ```
+   or 
+   ```bash
+   python.exe adremote-mcp/ssh_mcp_server.py
+   ```
 
 3. **Add the MCP in Codex**:
 
-   Add the same server to your Codex MCP config.
+   Add the same server to your Codex MCP config:
+   ```bash
+   python3 adremote-mcp/ssh_mcp_server.py
+   ```
 
 4. **Automatic setup**:
 
@@ -24,6 +34,7 @@ SSH remote access for MCP-compatible clients through Model Context Protocol (MCP
 
 ## Features
 
+- Works with MCP-compatible clients on Windows and Linux
 - Connect to remote servers via SSH
 - Execute commands remotely
 - Upload/download files via SFTP
@@ -36,13 +47,19 @@ SSH remote access for MCP-compatible clients through Model Context Protocol (MCP
 ```
 Connect to 192.168.1.100 with username ubuntu and password mypass
 ```
+
+or in shorter form:
+```
+ssh 192.168.1.100:22 ubuntu mypass
+```
+
 The MCP first tests the SSH connection with your username and password.
 If the login works, it generates or installs an SSH key, saves the key-based credential locally, and does not save the password.
 The password is only used the first time.
 
 ### Connect with password for a one-off session:
 ```
-Connect to 192.168.1.100 with username ubuntu and password mypass, save_credentials false
+ssh 192.168.1.100:22 ubuntu mypass, save_credentials false
 ```
 This keeps the live connection only. No reusable credential is saved and no automatic key bootstrap is attempted.
 
@@ -56,6 +73,7 @@ After the first successful setup, just use the saved credential name to connect 
 ```
 List files in /home directory on my server
 Run 'top' command on the remote server
+Execute script.py and monitor its log
 ```
 
 ### File transfers:
