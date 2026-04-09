@@ -264,7 +264,6 @@ class SSHMCPServer:
             key_class
             for key_class in (
                 getattr(paramiko, "RSAKey", None),
-                getattr(paramiko, "DSAKey", None),
                 getattr(paramiko, "ECDSAKey", None),
                 getattr(paramiko, "Ed25519Key", None),
             )
