@@ -1,6 +1,6 @@
 # SSH Remote MCP Server
 
-SSH remote access for Claude Code through Model Context Protocol (MCP).
+SSH remote access for MCP-compatible clients through Model Context Protocol (MCP).
 
 ## Quick Start
 
