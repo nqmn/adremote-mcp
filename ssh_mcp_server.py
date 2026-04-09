@@ -1,39 +1,70 @@
 #!/usr/bin/env python3
-"""
-SSH MCP Server - Model Context Protocol server for remote SSH connections to Ubuntu servers.
-Provides tools for connecting to remote Ubuntu servers via SSH and executing commands.
-"""
+"""SSH MCP Server for remote SSH connections and file transfers."""
 
 import asyncio
+import hashlib
 import json
 import logging
-import sys
+import os
 import time
-from typing import Dict, List, Optional, Any, Union
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Dict, List, Union
 
 import paramiko
-from paramiko import AutoAddPolicy
 from mcp.server import Server
 from mcp.server.models import InitializationOptions
 from mcp.server.stdio import stdio_server
 from mcp.types import (
-    Tool,
-    TextContent,
-    ImageContent,
     EmbeddedResource,
-    CallToolRequest,
-    CallToolResult,
-    ListToolsRequest,
-    ListToolsResult,
+    ImageContent,
     ServerCapabilities,
+    TextContent,
+    Tool,
     ToolsCapability,
 )
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+DEFAULT_CONNECT_TIMEOUT = 10
+DEFAULT_COMMAND_TIMEOUT = 30
+DEFAULT_HEALTH_TIMEOUT = 5
+DEFAULT_SAVE_DIRECT_CREDENTIALS = True
+ENV_ALLOWED_LOCAL_ROOTS = "SSH_MCP_ALLOWED_LOCAL_ROOTS"
+CREDENTIAL_STORE_FILE = ".ssh_mcp_credentials.json"
+CREDENTIAL_STORE_VERSION = 1
+KEY_STORE_DIR = ".ssh_mcp_keys"
+HOST_KEY_STORE_FILE = ".ssh_mcp_known_hosts"
+
+
+def _set_posix_permissions(path: Path, mode: int) -> None:
+    if os.name != "posix":
+        return
+    try:
+        os.chmod(path, mode)
+    except FileNotFoundError:
+        pass
+
+
+def _ensure_file(path: Path, *, mode: int = 0o600) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        path.touch()
+    _set_posix_permissions(path, mode)
+
+
+def _ensure_directory(path: Path, *, mode: int = 0o700) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    _set_posix_permissions(path, mode)
+
+
+def _write_secure_text(path: Path, content: str, *, mode: int = 0o600) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+    _set_posix_permissions(path, mode)
+
 
 @dataclass
 class SSHConnection:
@@ -42,11 +73,87 @@ class SSHConnection:
     hostname: str
     username: str
     port: int
+    known_hosts_path: str | None = None
     connected: bool = False
     last_used: float = 0.0
 
     def __post_init__(self):
         self.last_used = time.time()
+
+
+class CredentialStore:
+    """Persist SSH credentials locally for reuse."""
+
+    def __init__(self, store_path: Path):
+        self.store_path = store_path
+        self.store_path.parent.mkdir(parents=True, exist_ok=True)
+        _set_posix_permissions(self.store_path, 0o600)
+
+    def _read(self) -> Dict[str, Any]:
+        if not self.store_path.exists():
+            return {"version": CREDENTIAL_STORE_VERSION, "credentials": {}}
+
+        data = json.loads(self.store_path.read_text(encoding="utf-8"))
+        data.setdefault("version", CREDENTIAL_STORE_VERSION)
+        data.setdefault("credentials", {})
+        return data
+
+    def _write(self, data: Dict[str, Any]) -> None:
+        _write_secure_text(
+            self.store_path,
+            json.dumps(data, indent=2, sort_keys=True),
+        )
+
+    def save(self, name: str, payload: Dict[str, Any]) -> None:
+        data = self._read()
+        stored = dict(payload)
+
+        if stored.get("password"):
+            raise ValueError(
+                "Password-backed saved credentials are no longer supported. "
+                "Connect once with a password to bootstrap a key, or save a private key path."
+            )
+
+        data["credentials"][name] = stored
+        self._write(data)
+
+    def load(self, name: str) -> Dict[str, Any]:
+        data = self._read()
+        if name not in data["credentials"]:
+            raise KeyError(f"Saved credential '{name}' not found")
+
+        stored = dict(data["credentials"][name])
+        if stored.get("password"):
+            raise RuntimeError(
+                f"Saved credential '{name}' uses a legacy password entry that is no longer supported. "
+                "Delete it and save a key-based credential instead."
+            )
+
+        return stored
+
+    def delete(self, name: str) -> None:
+        data = self._read()
+        if name not in data["credentials"]:
+            raise KeyError(f"Saved credential '{name}' not found")
+        del data["credentials"][name]
+        self._write(data)
+
+    def list_entries(self) -> List[Dict[str, Any]]:
+        data = self._read()
+        entries: List[Dict[str, Any]] = []
+        for name, stored in sorted(data["credentials"].items()):
+            entries.append(
+                {
+                    "name": name,
+                    "hostname": stored.get("hostname"),
+                    "username": stored.get("username"),
+                    "port": stored.get("port", 22),
+                    "has_password": bool(stored.get("password")),
+                    "has_private_key_path": bool(stored.get("private_key_path")),
+                }
+            )
+        return entries
+
 
 class SSHMCPServer:
     """MCP Server for SSH operations on remote Ubuntu servers."""
@@ -54,7 +161,243 @@ class SSHMCPServer:
     def __init__(self):
         self.server = Server("ssh-mcp-server")
         self.connections: Dict[str, SSHConnection] = {}
+        self.allowed_local_roots = self._load_allowed_local_roots()
+        self.credential_store = CredentialStore(Path.home() / CREDENTIAL_STORE_FILE)
+        self.host_key_store_path = Path.home() / HOST_KEY_STORE_FILE
+        _ensure_file(self.host_key_store_path, mode=0o600)
+        self.key_store_dir = Path.home() / KEY_STORE_DIR
+        _ensure_directory(self.key_store_dir, mode=0o700)
         self.setup_tools()
+
+    def _load_allowed_local_roots(self) -> List[Path]:
+        """Load writable/readable local roots for file transfer tools."""
+        configured_roots = os.environ.get(ENV_ALLOWED_LOCAL_ROOTS, "").strip()
+        roots: List[Path] = []
+
+        if configured_roots:
+            for raw_root in configured_roots.split(os.pathsep):
+                if not raw_root.strip():
+                    continue
+                roots.append(Path(raw_root).expanduser().resolve(strict=False))
+
+        if not roots:
+            roots.append(Path.cwd().resolve(strict=False))
+
+        return roots
+
+    def _allowed_roots_text(self) -> str:
+        return ", ".join(str(root) for root in self.allowed_local_roots)
+
+    def _validate_local_path(self, raw_path: str, *, require_exists: bool) -> Path:
+        """Restrict local file access to explicitly allowed roots."""
+        resolved = Path(raw_path).expanduser().resolve(strict=False)
+
+        if require_exists and not resolved.exists():
+            raise FileNotFoundError(f"Local file not found: {resolved}")
+
+        for root in self.allowed_local_roots:
+            try:
+                resolved.relative_to(root)
+                return resolved
+            except ValueError:
+                continue
+
+        raise ValueError(
+            "Local path is outside allowed roots. "
+            f"Allowed roots: {self._allowed_roots_text()}"
+        )
+
+    async def _run_blocking(self, func, *args, **kwargs):
+        """Run Paramiko's blocking calls off the event loop."""
+        return await asyncio.to_thread(func, *args, **kwargs)
+
+    async def _exec_command(
+        self, client: paramiko.SSHClient, command: str, timeout: int
+    ) -> tuple[str, str, int]:
+        def run_command() -> tuple[str, str, int]:
+            _, stdout, stderr = client.exec_command(command, timeout=timeout)
+            stdout_text = stdout.read().decode("utf-8", errors="replace")
+            stderr_text = stderr.read().decode("utf-8", errors="replace")
+            exit_code = stdout.channel.recv_exit_status()
+            return stdout_text, stderr_text, exit_code
+
+        return await self._run_blocking(run_command)
+
+    def _key_paths(self, key_name: str) -> tuple[Path, Path]:
+        sanitized = "".join(
+            char for char in key_name if char.isalnum() or char in ("-", "_", ".")
+        ).strip(".")
+        if not sanitized:
+            raise ValueError("key_name must contain at least one alphanumeric character")
+        # Preserve legacy filenames for already-safe names, but add a stable hash
+        # when normalization would otherwise collapse distinct names together.
+        if sanitized == key_name:
+            key_filename = sanitized
+        else:
+            key_suffix = hashlib.sha256(key_name.encode("utf-8")).hexdigest()[:12]
+            key_filename = f"{sanitized}-{key_suffix}"
+        private_key_path = self.key_store_dir / key_filename
+        public_key_path = self.key_store_dir / f"{key_filename}.pub"
+        return private_key_path, public_key_path
+
+    async def _generate_local_keypair(
+        self, key_name: str, comment: str
+    ) -> tuple[Path, Path]:
+        private_key_path, public_key_path = self._key_paths(key_name)
+
+        if private_key_path.exists() or public_key_path.exists():
+            raise FileExistsError(f"Key '{key_name}' already exists in {self.key_store_dir}")
+
+        def generate_keypair() -> tuple[Path, Path]:
+            key = paramiko.RSAKey.generate(3072)
+            key.write_private_key_file(str(private_key_path))
+            os.chmod(private_key_path, 0o600)
+
+            public_key = f"{key.get_name()} {key.get_base64()} {comment}\n"
+            public_key_path.write_text(public_key, encoding="utf-8")
+            return private_key_path, public_key_path
+
+        return await self._run_blocking(generate_keypair)
+
+    def _private_key_classes(self) -> List[Any]:
+        return [
+            key_class
+            for key_class in (
+                getattr(paramiko, "RSAKey", None),
+                getattr(paramiko, "DSAKey", None),
+                getattr(paramiko, "ECDSAKey", None),
+                getattr(paramiko, "Ed25519Key", None),
+            )
+            if key_class is not None
+        ]
+
+    def _load_private_key(self, private_key_path: Path):
+        for key_class in self._private_key_classes():
+            try:
+                return key_class.from_private_key_file(str(private_key_path))
+            except paramiko.PasswordRequiredException as exc:
+                raise RuntimeError("Private key requires a passphrase (not supported)") from exc
+            except Exception:
+                continue
+
+        raise RuntimeError("Unable to load private key (unsupported format)")
+
+    async def _ensure_local_keypair(
+        self, key_name: str, comment: str
+    ) -> tuple[Path, Path]:
+        private_key_path, public_key_path = self._key_paths(key_name)
+
+        if private_key_path.exists():
+            if not public_key_path.exists():
+                key = await self._run_blocking(self._load_private_key, private_key_path)
+                public_key = f"{key.get_name()} {key.get_base64()} {comment}\n"
+                await self._run_blocking(
+                    _write_secure_text,
+                    public_key_path,
+                    public_key,
+                    mode=0o644,
+                )
+            return private_key_path, public_key_path
+
+        if public_key_path.exists():
+            raise FileExistsError(
+                f"Public key '{public_key_path}' exists without matching private key"
+            )
+
+        return await self._generate_local_keypair(key_name, comment)
+
+    async def _install_public_key_on_remote(
+        self, client: paramiko.SSHClient, public_key: str
+    ) -> None:
+        escaped_public_key = public_key.strip().replace("'", "'\"'\"'")
+        install_command = (
+            "umask 077 && mkdir -p ~/.ssh && touch ~/.ssh/authorized_keys && "
+            f"grep -Fqx '{escaped_public_key}' ~/.ssh/authorized_keys || "
+            f"printf '%s\\n' '{escaped_public_key}' >> ~/.ssh/authorized_keys"
+        )
+        _, stderr_text, exit_code = await self._exec_command(
+            client, install_command, DEFAULT_COMMAND_TIMEOUT
+        )
+        if exit_code != 0:
+            raise RuntimeError(
+                f"Failed to install public key on remote host: {stderr_text.strip()}"
+            )
+
+    def _save_key_credential(
+        self,
+        credential_name: str,
+        *,
+        hostname: str,
+        username: str,
+        private_key_path: Path,
+        port: int,
+        known_hosts_path: str | None,
+    ) -> None:
+        self.credential_store.save(
+            credential_name,
+            {
+                "hostname": hostname,
+                "username": username,
+                "private_key_path": str(private_key_path),
+                "port": port,
+                "known_hosts_path": known_hosts_path,
+                "trust_unknown_host": False,
+            },
+        )
+
+    async def _bootstrap_key_auth(
+        self,
+        *,
+        client: paramiko.SSHClient,
+        hostname: str,
+        username: str,
+        port: int,
+        credential_name: str,
+        key_name: str,
+        key_comment: str,
+        known_hosts_path: str | None,
+        overwrite_saved_credential: bool,
+    ) -> Path:
+        existing_credentials = {
+            entry["name"] for entry in self.credential_store.list_entries()
+        }
+        if credential_name in existing_credentials and not overwrite_saved_credential:
+            raise RuntimeError(
+                f"Saved credential '{credential_name}' already exists. "
+                "Pass overwrite_saved_credential=true to replace it."
+            )
+
+        private_key_path, public_key_path = await self._ensure_local_keypair(
+            key_name, key_comment
+        )
+        public_key = await self._run_blocking(
+            lambda: public_key_path.read_text(encoding="utf-8")
+        )
+        await self._install_public_key_on_remote(client, public_key)
+        self._save_key_credential(
+            credential_name,
+            hostname=hostname,
+            username=username,
+            private_key_path=private_key_path,
+            port=port,
+            known_hosts_path=known_hosts_path,
+        )
+        return private_key_path
+
+    def _build_client(self, known_hosts_path: str | None, trust_unknown_host: bool):
+        client = paramiko.SSHClient()
+        client.load_system_host_keys()
+        client.load_host_keys(str(self.host_key_store_path))
+        if known_hosts_path:
+            client.load_host_keys(str(Path(known_hosts_path).expanduser()))
+        if trust_unknown_host:
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        else:
+            client.set_missing_host_key_policy(paramiko.RejectPolicy())
+        return client
+
+    def _persist_trusted_host_keys(self, client: paramiko.SSHClient) -> None:
+        client.save_host_keys(str(self.host_key_store_path))
 
     def setup_tools(self):
         """Register all available tools."""
@@ -78,7 +421,7 @@ class SSHMCPServer:
                             },
                             "password": {
                                 "type": "string",
-                                "description": "SSH password (optional if using key auth)"
+                                "description": "SSH password for first-time bootstrap when no private key is available"
                             },
                             "private_key_path": {
                                 "type": "string",
@@ -93,9 +436,79 @@ class SSHMCPServer:
                                 "type": "string",
                                 "description": "Name for this connection (default: hostname)",
                                 "default": None
+                            },
+                            "known_hosts_path": {
+                                "type": "string",
+                                "description": "Optional path to a known_hosts file to trust in addition to system host keys"
+                            },
+                            "trust_unknown_host": {
+                                "type": "boolean",
+                                "description": "Allow connecting to hosts not present in known_hosts. Defaults to false.",
+                                "default": False
+                            },
+                            "saved_credential_name": {
+                                "type": "string",
+                                "description": "Load connection details from a saved local credential entry"
+                            },
+                            "save_credentials": {
+                                "type": "boolean",
+                                "description": "Persist a reusable local credential after a successful connect. Defaults to true for direct logins with password or private key. Password logins are converted into saved key-based credentials.",
+                                "default": DEFAULT_SAVE_DIRECT_CREDENTIALS
+                            },
+                            "credential_name": {
+                                "type": "string",
+                                "description": "Name to use when saving credentials locally. Defaults to connection_name or hostname."
+                            }
+                        }
+                    }
+                ),
+                Tool(
+                    name="ssh_connect_saved",
+                    description="Connect to a remote server using a saved local SSH credential name",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "name": {
+                                "type": "string",
+                                "description": "Saved credential name to use for the connection"
+                            },
+                            "connection_name": {
+                                "type": "string",
+                                "description": "Optional active connection name override"
                             }
                         },
-                        "required": ["hostname", "username"]
+                        "required": ["name"]
+                    }
+                ),
+                Tool(
+                    name="ssh_setup_key_auth",
+                    description="Generate a local SSH keypair, install the public key on the remote server, and save a key-based credential for future connections",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "connection_name": {
+                                "type": "string",
+                                "description": "Existing active SSH connection that authenticated with a password"
+                            },
+                            "credential_name": {
+                                "type": "string",
+                                "description": "Saved credential name for future key-based logins"
+                            },
+                            "key_name": {
+                                "type": "string",
+                                "description": "Local key filename stem. Defaults to credential_name or connection_name."
+                            },
+                            "key_comment": {
+                                "type": "string",
+                                "description": "Comment appended to the generated public key"
+                            },
+                            "overwrite_saved_credential": {
+                                "type": "boolean",
+                                "description": "Overwrite an existing saved credential with the same credential_name",
+                                "default": False
+                            }
+                        },
+                        "required": ["connection_name"]
                     }
                 ),
                 Tool(
@@ -123,7 +536,7 @@ class SSHMCPServer:
                 ),
                 Tool(
                     name="ssh_upload_file",
-                    description="Upload a file to the remote server via SFTP",
+                    description="Upload a local file from an allowed local root to the remote server via SFTP",
                     inputSchema={
                         "type": "object",
                         "properties": {
@@ -145,7 +558,7 @@ class SSHMCPServer:
                 ),
                 Tool(
                     name="ssh_download_file",
-                    description="Download a file from the remote server via SFTP",
+                    description="Download a remote file to an allowed local root via SFTP",
                     inputSchema={
                         "type": "object",
                         "properties": {
@@ -163,6 +576,72 @@ class SSHMCPServer:
                             }
                         },
                         "required": ["connection_name", "remote_path", "local_path"]
+                    }
+                ),
+                Tool(
+                    name="ssh_save_credentials",
+                    description="Save SSH credentials locally under a reusable name. If a password is provided, the server is contacted once to bootstrap a key and only the generated key credential is saved.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "name": {
+                                "type": "string",
+                                "description": "Saved credential name"
+                            },
+                            "hostname": {
+                                "type": "string",
+                                "description": "Remote server hostname or IP address"
+                            },
+                            "username": {
+                                "type": "string",
+                                "description": "SSH username"
+                            },
+                            "password": {
+                                "type": "string",
+                                "description": "SSH password for first-time bootstrap when no private key is available"
+                            },
+                            "private_key_path": {
+                                "type": "string",
+                                "description": "Path to private key file (optional)"
+                            },
+                            "port": {
+                                "type": "integer",
+                                "description": "SSH port (default: 22)",
+                                "default": 22
+                            },
+                            "known_hosts_path": {
+                                "type": "string",
+                                "description": "Optional path to an extra known_hosts file"
+                            },
+                            "trust_unknown_host": {
+                                "type": "boolean",
+                                "description": "Allow connecting to hosts not present in known_hosts. Defaults to false.",
+                                "default": False
+                            }
+                        },
+                        "required": ["name", "hostname", "username"]
+                    }
+                ),
+                Tool(
+                    name="ssh_list_saved_credentials",
+                    description="List saved local SSH credential entries",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {}
+                    }
+                ),
+                Tool(
+                    name="ssh_delete_saved_credentials",
+                    description="Delete a saved local SSH credential entry",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "name": {
+                                "type": "string",
+                                "description": "Saved credential name to delete"
+                            }
+                        },
+                        "required": ["name"]
                     }
                 ),
                 Tool(
@@ -203,16 +682,29 @@ class SSHMCPServer:
             ]
 
         @self.server.call_tool()
-        async def call_tool(name: str, arguments: Dict[str, Any]) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+        async def call_tool(
+            name: str, arguments: Dict[str, Any] | None
+        ) -> List[Union[TextContent, ImageContent, EmbeddedResource]]:
+            arguments = arguments or {}
             try:
                 if name == "ssh_connect":
                     return await self._ssh_connect(arguments)
+                elif name == "ssh_connect_saved":
+                    return await self._ssh_connect_saved(arguments)
                 elif name == "ssh_execute":
                     return await self._ssh_execute(arguments)
+                elif name == "ssh_setup_key_auth":
+                    return await self._ssh_setup_key_auth(arguments)
                 elif name == "ssh_upload_file":
                     return await self._ssh_upload_file(arguments)
                 elif name == "ssh_download_file":
                     return await self._ssh_download_file(arguments)
+                elif name == "ssh_save_credentials":
+                    return await self._ssh_save_credentials(arguments)
+                elif name == "ssh_list_saved_credentials":
+                    return await self._ssh_list_saved_credentials(arguments)
+                elif name == "ssh_delete_saved_credentials":
+                    return await self._ssh_delete_saved_credentials(arguments)
                 elif name == "ssh_disconnect":
                     return await self._ssh_disconnect(arguments)
                 elif name == "ssh_list_connections":
@@ -227,22 +719,55 @@ class SSHMCPServer:
 
     async def _ssh_connect(self, args: Dict[str, Any]) -> List[TextContent]:
         """Establish SSH connection to remote server."""
-        hostname = args["hostname"]
-        username = args["username"]
-        password = args.get("password")
-        private_key_path = args.get("private_key_path")
-        port = args.get("port", 22)
-        connection_name = args.get("connection_name", hostname)
+        saved_credential_name = args.get("saved_credential_name")
+        credential_data: Dict[str, Any] = {}
+        if saved_credential_name:
+            try:
+                credential_data = self.credential_store.load(saved_credential_name)
+            except KeyError as e:
+                return [TextContent(type="text", text=str(e))]
+            except Exception as e:
+                return [TextContent(
+                    type="text",
+                    text=f"Failed to load saved credential: {str(e)}",
+                )]
+
+        merged = dict(credential_data)
+        merged.update({key: value for key, value in args.items() if value is not None})
+
+        hostname = merged.get("hostname")
+        username = merged.get("username")
+        if not hostname or not username:
+            return [TextContent(
+                type="text",
+                text="hostname and username are required unless provided by saved_credential_name",
+            )]
+
+        password = merged.get("password")
+        private_key_path = merged.get("private_key_path")
+        port = merged.get("port", 22)
+        connection_name = merged.get("connection_name", hostname)
+        known_hosts_path = merged.get("known_hosts_path")
+        trust_unknown_host = merged.get("trust_unknown_host", False)
+        direct_credentials_provided = (
+            bool(args.get("password")) or bool(args.get("private_key_path"))
+        )
+        if "save_credentials" in args:
+            save_credentials = bool(args.get("save_credentials"))
+        else:
+            save_credentials = (
+                DEFAULT_SAVE_DIRECT_CREDENTIALS
+                and direct_credentials_provided
+                and not saved_credential_name
+            )
+        credential_name = args.get("credential_name") or connection_name
+        used_password_auth = bool(password) and not private_key_path
 
         if connection_name in self.connections:
             return [TextContent(type="text", text=f"Connection '{connection_name}' already exists")]
 
         try:
-            client = paramiko.SSHClient()
-            client.set_missing_host_key_policy(AutoAddPolicy())
-
-            # Set connection timeout
-            client.timeout = 10.0
+            client = self._build_client(known_hosts_path, trust_unknown_host)
 
             # Determine authentication method
             if private_key_path:
@@ -250,31 +775,44 @@ class SSHMCPServer:
                 if not private_key_path.exists():
                     return [TextContent(type="text", text=f"Private key file not found: {private_key_path}")]
 
-                # Try different key types
-                key = None
-                for key_class in [paramiko.RSAKey, paramiko.DSAKey, paramiko.ECDSAKey, paramiko.Ed25519Key]:
-                    try:
-                        key = key_class.from_private_key_file(str(private_key_path))
-                        break
-                    except paramiko.PasswordRequiredException:
-                        return [TextContent(type="text", text="Private key requires a passphrase (not supported)")]
-                    except Exception:
-                        continue
+                try:
+                    key = await self._run_blocking(self._load_private_key, private_key_path)
+                except RuntimeError as e:
+                    return [TextContent(type="text", text=str(e))]
 
-                if key is None:
-                    return [TextContent(type="text", text="Unable to load private key (unsupported format)")]
-
-                client.connect(hostname, port=port, username=username, pkey=key, timeout=10)
+                await self._run_blocking(
+                    client.connect,
+                    hostname,
+                    port=port,
+                    username=username,
+                    pkey=key,
+                    timeout=DEFAULT_CONNECT_TIMEOUT,
+                    allow_agent=False,
+                    look_for_keys=False,
+                )
             elif password:
-                client.connect(hostname, port=port, username=username, password=password, timeout=10)
+                await self._run_blocking(
+                    client.connect,
+                    hostname,
+                    port=port,
+                    username=username,
+                    password=password,
+                    timeout=DEFAULT_CONNECT_TIMEOUT,
+                    allow_agent=False,
+                    look_for_keys=False,
+                )
             else:
                 return [TextContent(type="text", text="Either password or private_key_path must be provided")]
 
+            if trust_unknown_host:
+                await self._run_blocking(self._persist_trusted_host_keys, client)
+
             # Test the connection
             try:
-                stdin, stdout, stderr = client.exec_command("echo 'Connection test'", timeout=5)
-                test_output = stdout.read().decode('utf-8').strip()
-                if test_output != "Connection test":
+                test_output, _, exit_code = await self._exec_command(
+                    client, "echo 'Connection test'", DEFAULT_HEALTH_TIMEOUT
+                )
+                if exit_code != 0 or test_output.strip() != "Connection test":
                     logger.warning(f"Connection test failed for {hostname}")
             except Exception as e:
                 logger.warning(f"Connection test warning for {hostname}: {str(e)}")
@@ -284,22 +822,144 @@ class SSHMCPServer:
                 hostname=hostname,
                 username=username,
                 port=port,
+                known_hosts_path=known_hosts_path,
                 connected=True
             )
 
             self.connections[connection_name] = connection
 
+            status_suffix = ""
+            if used_password_auth:
+                bootstrap_credential_name = (
+                    saved_credential_name
+                    or args.get("credential_name")
+                    or (credential_name if save_credentials else f"{username}@{hostname}:{port}")
+                )
+                try:
+                    await self._bootstrap_key_auth(
+                        client=client,
+                        hostname=hostname,
+                        username=username,
+                        port=port,
+                        credential_name=bootstrap_credential_name,
+                        key_name=bootstrap_credential_name,
+                        key_comment=f"{username}@{hostname} via ssh-mcp",
+                        known_hosts_path=known_hosts_path,
+                        overwrite_saved_credential=True,
+                    )
+                    status_suffix = (
+                        f" Installed SSH public key and saved key-based credential "
+                        f"'{bootstrap_credential_name}'. Future logins can use "
+                        f"ssh_connect_saved name={bootstrap_credential_name}."
+                    )
+                except Exception as e:
+                    status_suffix = (
+                        f" Automatic key bootstrap failed: {str(e)}. "
+                        "The live connection is still available, but future saved logins "
+                        "will not use key auth until bootstrap succeeds."
+                    )
+            elif save_credentials:
+                self._save_key_credential(
+                    credential_name,
+                    hostname=hostname,
+                    username=username,
+                    private_key_path=private_key_path,
+                    port=port,
+                    known_hosts_path=known_hosts_path,
+                )
+                status_suffix = f" Saved key-based credential '{credential_name}' locally."
+
             return [TextContent(
                 type="text",
-                text=f"Successfully connected to {hostname}:{port} as {username} (connection: {connection_name})"
+                text=(
+                    f"Successfully connected to {hostname}:{port} as {username} "
+                    f"(connection: {connection_name})"
+                    + status_suffix
+                )
             )]
 
         except paramiko.AuthenticationException:
             return [TextContent(type="text", text="Authentication failed - check username/password or key")]
+        except paramiko.BadHostKeyException as e:
+            return [TextContent(
+                type="text",
+                text=(
+                    f"Host key verification failed for {hostname}: {str(e)}. "
+                    "Update your known_hosts entry or pass trust_unknown_host=true to trust on first use and pin the host key locally."
+                ),
+            )]
         except paramiko.SSHException as e:
-            return [TextContent(type="text", text=f"SSH connection failed: {str(e)}")]
+            return [TextContent(
+                type="text",
+                text=(
+                    f"SSH connection failed: {str(e)}. "
+                    "If this is a new host, add it to known_hosts or pass trust_unknown_host=true to pin it locally."
+                ),
+            )]
         except Exception as e:
             return [TextContent(type="text", text=f"Failed to connect: {str(e)}")]
+
+    async def _ssh_connect_saved(self, args: Dict[str, Any]) -> List[TextContent]:
+        """Connect using a saved credential entry."""
+        connect_args: Dict[str, Any] = {
+            "saved_credential_name": args["name"],
+        }
+        if args.get("connection_name"):
+            connect_args["connection_name"] = args["connection_name"]
+        return await self._ssh_connect(connect_args)
+
+    async def _ssh_setup_key_auth(self, args: Dict[str, Any]) -> List[TextContent]:
+        """Bootstrap SSH key authentication for an active connection."""
+        connection_name = args["connection_name"]
+        if connection_name not in self.connections:
+            return [TextContent(type="text", text=f"Connection '{connection_name}' not found")]
+
+        connection = self.connections[connection_name]
+        if not connection.connected:
+            return [TextContent(type="text", text=f"Connection '{connection_name}' is not active")]
+
+        credential_name = args.get("credential_name", connection_name)
+        key_name = args.get("key_name", credential_name)
+        key_comment = args.get(
+            "key_comment", f"{connection.username}@{connection.hostname} via ssh-mcp"
+        )
+        overwrite_saved_credential = bool(args.get("overwrite_saved_credential", False))
+
+        existing_credentials = {
+            entry["name"] for entry in self.credential_store.list_entries()
+        }
+        if credential_name in existing_credentials and not overwrite_saved_credential:
+            return [TextContent(
+                type="text",
+                text=(
+                    f"Saved credential '{credential_name}' already exists. "
+                    "Pass overwrite_saved_credential=true to replace it."
+                ),
+            )]
+
+        try:
+            await self._bootstrap_key_auth(
+                client=connection.client,
+                hostname=connection.hostname,
+                username=connection.username,
+                port=connection.port,
+                credential_name=credential_name,
+                key_name=key_name,
+                key_comment=key_comment,
+                known_hosts_path=connection.known_hosts_path,
+                overwrite_saved_credential=overwrite_saved_credential,
+            )
+
+            return [TextContent(
+                type="text",
+                text=(
+                    f"Installed SSH public key on {connection.hostname} and saved "
+                    f"key-based credential '{credential_name}'. Future logins can use "
+                    f"ssh_connect_saved name={credential_name}."
+                ),
+            )]
+        except Exception as e:
+            return [TextContent(type="text", text=f"Failed to set up key auth: {str(e)}")]
 
     async def _ssh_execute(self, args: Dict[str, Any]) -> List[TextContent]:
         """Execute command on remote server."""
@@ -318,11 +978,9 @@ class SSHMCPServer:
             # Update last used timestamp
             connection.last_used = time.time()
 
-            stdin, stdout, stderr = connection.client.exec_command(command, timeout=timeout)
-
-            stdout_text = stdout.read().decode('utf-8')
-            stderr_text = stderr.read().decode('utf-8')
-            exit_code = stdout.channel.recv_exit_status()
+            stdout_text, stderr_text, exit_code = await self._exec_command(
+                connection.client, command, timeout
+            )
 
             result = f"Command: {command}\n"
             result += f"Exit Code: {exit_code}\n\n"
@@ -355,26 +1013,29 @@ class SSHMCPServer:
             return [TextContent(type="text", text=f"Connection '{connection_name}' is not active")]
 
         try:
-            # Check if local file exists
-            if not Path(local_path).exists():
-                return [TextContent(type="text", text=f"Local file not found: {local_path}")]
+            source_path = self._validate_local_path(local_path, require_exists=True)
 
             # Update last used timestamp
             connection.last_used = time.time()
 
-            sftp = connection.client.open_sftp()
-            try:
-                sftp.put(local_path, remote_path)
-            finally:
-                sftp.close()
+            def upload_file() -> None:
+                sftp = connection.client.open_sftp()
+                try:
+                    sftp.put(str(source_path), remote_path)
+                finally:
+                    sftp.close()
+
+            await self._run_blocking(upload_file)
 
             return [TextContent(
                 type="text",
-                text=f"Successfully uploaded {local_path} to {remote_path} on {connection.hostname}"
+                text=f"Successfully uploaded {source_path} to {remote_path} on {connection.hostname}"
             )]
 
         except FileNotFoundError:
             return [TextContent(type="text", text=f"Local file not found: {local_path}")]
+        except ValueError as e:
+            return [TextContent(type="text", text=str(e))]
         except paramiko.SFTPError as e:
             return [TextContent(type="text", text=f"SFTP error: {str(e)}")]
         except Exception as e:
@@ -394,24 +1055,31 @@ class SSHMCPServer:
             return [TextContent(type="text", text=f"Connection '{connection_name}' is not active")]
 
         try:
+            target_path = self._validate_local_path(local_path, require_exists=False)
+
             # Update last used timestamp
             connection.last_used = time.time()
 
             # Create local directory if it doesn't exist
-            local_dir = Path(local_path).parent
+            local_dir = target_path.parent
             local_dir.mkdir(parents=True, exist_ok=True)
 
-            sftp = connection.client.open_sftp()
-            try:
-                sftp.get(remote_path, local_path)
-            finally:
-                sftp.close()
+            def download_file() -> None:
+                sftp = connection.client.open_sftp()
+                try:
+                    sftp.get(remote_path, str(target_path))
+                finally:
+                    sftp.close()
+
+            await self._run_blocking(download_file)
 
             return [TextContent(
                 type="text",
-                text=f"Successfully downloaded {remote_path} to {local_path} from {connection.hostname}"
+                text=f"Successfully downloaded {remote_path} to {target_path} from {connection.hostname}"
             )]
 
+        except ValueError as e:
+            return [TextContent(type="text", text=str(e))]
         except paramiko.SFTPError as e:
             return [TextContent(type="text", text=f"SFTP error (file may not exist): {str(e)}")]
         except Exception as e:
@@ -426,7 +1094,7 @@ class SSHMCPServer:
 
         try:
             connection = self.connections[connection_name]
-            connection.client.close()
+            await self._run_blocking(connection.client.close)
             connection.connected = False
             del self.connections[connection_name]
 
@@ -438,12 +1106,140 @@ class SSHMCPServer:
         except Exception as e:
             return [TextContent(type="text", text=f"Failed to disconnect: {str(e)}")]
 
+    async def _ssh_save_credentials(self, args: Dict[str, Any]) -> List[TextContent]:
+        """Save SSH credentials locally."""
+        name = args["name"]
+        hostname = args["hostname"]
+        username = args["username"]
+        password = args.get("password")
+        private_key_path = args.get("private_key_path")
+        port = args.get("port", 22)
+        known_hosts_path = args.get("known_hosts_path")
+        trust_unknown_host = args.get("trust_unknown_host", False)
+
+        if not password and not private_key_path:
+            return [TextContent(
+                type="text",
+                text="Either password or private_key_path must be provided to save credentials",
+            )]
+
+        try:
+            if private_key_path:
+                self._save_key_credential(
+                    name,
+                    hostname=hostname,
+                    username=username,
+                    private_key_path=Path(private_key_path).expanduser(),
+                    port=port,
+                    known_hosts_path=known_hosts_path,
+                )
+                return [TextContent(
+                    type="text",
+                    text=(
+                        f"Saved key-based credential '{name}' locally in "
+                        f"{self.credential_store.store_path}."
+                    ),
+                )]
+
+            client = self._build_client(known_hosts_path, trust_unknown_host)
+            try:
+                await self._run_blocking(
+                    client.connect,
+                    hostname,
+                    port=port,
+                    username=username,
+                    password=password,
+                    timeout=DEFAULT_CONNECT_TIMEOUT,
+                    allow_agent=False,
+                    look_for_keys=False,
+                )
+                if trust_unknown_host:
+                    await self._run_blocking(self._persist_trusted_host_keys, client)
+                await self._bootstrap_key_auth(
+                    client=client,
+                    hostname=hostname,
+                    username=username,
+                    port=port,
+                    credential_name=name,
+                    key_name=name,
+                    key_comment=f"{username}@{hostname} via ssh-mcp",
+                    known_hosts_path=known_hosts_path,
+                    overwrite_saved_credential=True,
+                )
+            finally:
+                await self._run_blocking(client.close)
+        except paramiko.AuthenticationException:
+            return [TextContent(type="text", text="Authentication failed - check username/password or key")]
+        except paramiko.BadHostKeyException as e:
+            return [TextContent(
+                type="text",
+                text=(
+                    f"Host key verification failed for {hostname}: {str(e)}. "
+                    "Update your known_hosts entry or pass trust_unknown_host=true to trust on first use and pin the host key locally."
+                ),
+            )]
+        except paramiko.SSHException as e:
+            return [TextContent(
+                type="text",
+                text=(
+                    f"SSH connection failed: {str(e)}. "
+                    "If this is a new host, add it to known_hosts or pass trust_unknown_host=true to pin it locally."
+                ),
+            )]
+        except Exception as e:
+            return [TextContent(
+                type="text",
+                text=f"Unable to save credentials: {str(e)}",
+            )]
+
+        return [TextContent(
+            type="text",
+            text=(
+                f"Saved key-based credential '{name}' locally in "
+                f"{self.credential_store.store_path}. A password was used only to "
+                "bootstrap the generated SSH key."
+            ),
+        )]
+
+    async def _ssh_list_saved_credentials(self, args: Dict[str, Any]) -> List[TextContent]:
+        """List saved SSH credentials."""
+        entries = self.credential_store.list_entries()
+        if not entries:
+            return [TextContent(type="text", text="No saved SSH credentials")]
+
+        lines = [f"Saved SSH credentials ({self.credential_store.store_path}):"]
+        for entry in entries:
+            auth_mode = (
+                "legacy password entry (unsupported)"
+                if entry["has_password"]
+                else "private key"
+            )
+            lines.append(
+                f"- {entry['name']}: {entry['username']}@{entry['hostname']}:{entry['port']} "
+                f"({auth_mode})"
+            )
+
+        return [TextContent(type="text", text="\n".join(lines))]
+
+    async def _ssh_delete_saved_credentials(self, args: Dict[str, Any]) -> List[TextContent]:
+        """Delete saved SSH credentials."""
+        name = args["name"]
+        try:
+            self.credential_store.delete(name)
+        except KeyError as e:
+            return [TextContent(type="text", text=str(e))]
+
+        return [TextContent(type="text", text=f"Deleted saved credential '{name}'")]
+
     async def _ssh_list_connections(self, args: Dict[str, Any]) -> List[TextContent]:
         """List all active SSH connections."""
         if not self.connections:
             return [TextContent(type="text", text="No active SSH connections")]
 
-        result = "Active SSH Connections:\n"
+        result = (
+            "Active SSH Connections:\n"
+            f"Allowed local file roots: {self._allowed_roots_text()}\n"
+        )
         for name, conn in self.connections.items():
             status = "Connected" if conn.connected else "Disconnected"
             last_used = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(conn.last_used))
@@ -482,14 +1278,16 @@ class SSHMCPServer:
 
         try:
             # Simple test command
-            stdin, stdout, stderr = connection.client.exec_command("echo 'health_check'", timeout=5)
-            output = stdout.read().decode('utf-8').strip()
-            exit_code = stdout.channel.recv_exit_status()
+            output, _, exit_code = await self._exec_command(
+                connection.client, "echo 'health_check'", DEFAULT_HEALTH_TIMEOUT
+            )
+            output = output.strip()
 
             if exit_code == 0 and output == "health_check":
-                uptime_cmd = "uptime"
-                stdin, stdout, stderr = connection.client.exec_command(uptime_cmd, timeout=5)
-                uptime_output = stdout.read().decode('utf-8').strip()
+                uptime_output, _, _ = await self._exec_command(
+                    connection.client, "uptime", DEFAULT_HEALTH_TIMEOUT
+                )
+                uptime_output = uptime_output.strip()
 
                 last_used = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(connection.last_used))
                 return f"Status: Healthy, Last used: {last_used}, Server uptime: {uptime_output}"
@@ -509,17 +1307,21 @@ class SSHMCPServer:
                 write_stream,
                 InitializationOptions(
                     server_name="ssh-mcp-server",
-                    server_version="1.0.0",
+                    server_version="1.0.1",
                     capabilities=ServerCapabilities(
                         tools=ToolsCapability()
                     )
                 )
             )
 
-async def main():
-    """Main entry point."""
+async def async_main():
+    """Async entry point."""
     server = SSHMCPServer()
     await server.run()
 
+def main():
+    """Console script entry point."""
+    asyncio.run(async_main())
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
