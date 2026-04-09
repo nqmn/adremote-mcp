@@ -6,10 +6,11 @@ SSH remote access for Claude Code through Model Context Protocol (MCP).
 
 Version `1.0.1` adds safer and more practical day-to-day SSH workflows:
 
-- Direct password logins now bootstrap a local SSH key and save a reusable key-based credential automatically
+- Direct logins still save reusable credentials by default, but `save_credentials=false` now cleanly opts out for password sessions too
 - Saved credential flows now include connect, save, list, delete, and manual key setup helpers
 - Host trust and file transfer rules are stricter, with local root restrictions and trust-on-first-use host pinning
 - Saved credentials are key-based, so no master password is required for normal use
+- Manually saved private key paths are validated when you save them, not later on first connect
 
 ## Quick Start
 
@@ -33,7 +34,7 @@ Version `1.0.1` adds safer and more practical day-to-day SSH workflows:
 
 3. **Optional: local credential memory**
    Saved credentials are stored at `~/.ssh_mcp_credentials.json`.
-   New password-based connects and saves are treated as first-time bootstrap only: the MCP installs a generated SSH key on the server and saves the key-based credential for future logins.
+   New password-based connects and saves are treated as first-time bootstrap only: when `save_credentials` is left at its default `true`, the MCP installs a generated SSH key on the server and saves the key-based credential for future logins.
    No master password is required because reusable saved credentials are stored as key-based logins, not password-backed entries.
 
 4. **Configure Claude Desktop**:
@@ -124,7 +125,13 @@ If you already use SSH keys, point the MCP at your existing private key. If not,
 ```
 Connect to 192.168.1.100 with username ubuntu and password mypass
 ```
-This now bootstraps a local SSH key automatically and saves a reusable key-based credential for later logins.
+This bootstraps a local SSH key automatically and saves a reusable key-based credential for later logins when `save_credentials` is left at its default `true`.
+
+### Connect with password for a one-off session:
+```
+Connect to 192.168.1.100 with username ubuntu and password mypass, save_credentials false
+```
+This keeps the live connection only. No reusable credential is saved and no automatic key bootstrap is attempted.
 
 ### Connect with SSH key:
 ```
@@ -153,6 +160,7 @@ Connect to staging server 10.0.1.200 with password stagingpass123 as user ubuntu
 Save SSH credentials locally with name prod-web for host 10.0.1.100, username deploy, and password mypass
 ```
 If you provide a password, the MCP connects once, installs a generated SSH key, and saves only the key-based credential.
+If you provide `private_key_path`, the path must exist and the key must be loadable before the credential is accepted.
 
 ### Connect using saved credentials:
 ```
@@ -182,7 +190,7 @@ This saves a key-based credential named `prod-web`. The password is only used fo
 Connect to 10.0.1.100 with username deploy and password mypass
 Connect to 10.0.1.100 with username deploy and private key ~/.ssh/prod_key
 ```
-Direct logins now save reusable credentials by default. The saved name defaults to `connection_name` if provided, otherwise `hostname`. Set `save_credentials=false` to opt out.
+Direct logins save reusable credentials by default. The saved name defaults to `connection_name` if provided, otherwise `hostname`. Set `save_credentials=false` to opt out.
 
 ### Execute commands:
 ```
@@ -204,7 +212,7 @@ Show me all active SSH connections
 
 ## Requirements
 
-- Python 3.8+
+- Python 3.10+
 - paramiko
 - mcp
 
@@ -215,12 +223,13 @@ Show me all active SSH connections
 - `trust_unknown_host=true` performs trust-on-first-use and pins accepted keys in `~/.ssh_mcp_known_hosts`
 - Supports password and key authentication
 - Direct password and private-key login flows save reusable credentials by default
-- New password-based credential flows automatically bootstrap a real SSH keypair and save the key for future logins
+- Password-based direct logins only bootstrap and save a key when `save_credentials` remains enabled
 - `ssh_setup_key_auth` remains available for manual key rotation or custom naming after a live login
 - Upload/download access is restricted to `SSH_MCP_ALLOWED_LOCAL_ROOTS`
 - Saved credentials live in `~/.ssh_mcp_credentials.json`
 - Legacy password-backed saved credentials are no longer supported; recreate them as key-based entries if needed
 - Generated SSH keys live in `~/.ssh_mcp_keys`
+- `private_key_path` entries are validated when saved so broken credentials fail fast
 - Use strong passwords if you still rely on password auth for first-time bootstrap
 - Limit SSH access with firewall rules and prefer non-root users with `sudo`
 - Connection timeouts enforced

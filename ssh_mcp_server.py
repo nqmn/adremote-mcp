@@ -829,7 +829,7 @@ class SSHMCPServer:
             self.connections[connection_name] = connection
 
             status_suffix = ""
-            if used_password_auth:
+            if used_password_auth and save_credentials:
                 bootstrap_credential_name = (
                     saved_credential_name
                     or args.get("credential_name")
@@ -858,6 +858,11 @@ class SSHMCPServer:
                         "The live connection is still available, but future saved logins "
                         "will not use key auth until bootstrap succeeds."
                     )
+            elif used_password_auth:
+                status_suffix = (
+                    " Password authentication was used for this live session only. "
+                    "No reusable credential was saved."
+                )
             elif save_credentials:
                 self._save_key_credential(
                     credential_name,
@@ -1125,11 +1130,23 @@ class SSHMCPServer:
 
         try:
             if private_key_path:
+                private_key = Path(private_key_path).expanduser()
+                if not private_key.exists():
+                    return [TextContent(
+                        type="text",
+                        text=f"Private key file not found: {private_key}",
+                    )]
+
+                try:
+                    await self._run_blocking(self._load_private_key, private_key)
+                except RuntimeError as e:
+                    return [TextContent(type="text", text=str(e))]
+
                 self._save_key_credential(
                     name,
                     hostname=hostname,
                     username=username,
-                    private_key_path=Path(private_key_path).expanduser(),
+                    private_key_path=private_key.resolve(strict=False),
                     port=port,
                     known_hosts_path=known_hosts_path,
                 )
