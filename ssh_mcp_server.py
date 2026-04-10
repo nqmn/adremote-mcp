@@ -73,6 +73,9 @@ class SSHConnection:
     hostname: str
     username: str
     port: int
+    jump_client: paramiko.SSHClient | None = None
+    jump_description: str | None = None
+    jump_host: Dict[str, Any] | None = None
     known_hosts_path: str | None = None
     connected: bool = False
     last_used: float = 0.0
@@ -148,6 +151,7 @@ class CredentialStore:
                     "hostname": stored.get("hostname"),
                     "username": stored.get("username"),
                     "port": stored.get("port", 22),
+                    "jump_host": stored.get("jump_host"),
                     "has_password": bool(stored.get("password")),
                     "has_private_key_path": bool(stored.get("private_key_path")),
                 }
@@ -331,7 +335,20 @@ class SSHMCPServer:
         private_key_path: Path,
         port: int,
         known_hosts_path: str | None,
+        jump_host: Dict[str, Any] | None = None,
     ) -> None:
+        stored_jump_host = None
+        if jump_host:
+            if jump_host.get("password"):
+                raise ValueError(
+                    "Saved credentials do not support password-backed jump hosts. "
+                    "Use jump_host.private_key_path or connect without saving credentials."
+                )
+            stored_jump_host = {
+                key: value
+                for key, value in jump_host.items()
+                if key != "password"
+            }
         self.credential_store.save(
             credential_name,
             {
@@ -341,6 +358,7 @@ class SSHMCPServer:
                 "port": port,
                 "known_hosts_path": known_hosts_path,
                 "trust_unknown_host": False,
+                "jump_host": stored_jump_host,
             },
         )
 
@@ -356,6 +374,7 @@ class SSHMCPServer:
         key_comment: str,
         known_hosts_path: str | None,
         overwrite_saved_credential: bool,
+        jump_host: Dict[str, Any] | None = None,
     ) -> Path:
         existing_credentials = {
             entry["name"] for entry in self.credential_store.list_entries()
@@ -380,8 +399,167 @@ class SSHMCPServer:
             private_key_path=private_key_path,
             port=port,
             known_hosts_path=known_hosts_path,
+            jump_host=jump_host,
         )
         return private_key_path
+
+    def _normalize_jump_host(self, jump_host: Any) -> Dict[str, Any] | None:
+        if jump_host is None:
+            return None
+        if not isinstance(jump_host, dict):
+            raise ValueError("jump_host must be an object")
+
+        normalized = {
+            key: value
+            for key, value in jump_host.items()
+            if value is not None
+        }
+        hostname = normalized.get("hostname")
+        username = normalized.get("username")
+        if not hostname or not username:
+            raise ValueError("jump_host.hostname and jump_host.username are required")
+
+        normalized["port"] = int(normalized.get("port", 22))
+
+        if not normalized.get("password") and not normalized.get("private_key_path"):
+            raise ValueError(
+                "jump_host requires either password or private_key_path"
+            )
+
+        return normalized
+
+    async def _connect_with_auth(
+        self,
+        client: paramiko.SSHClient,
+        *,
+        hostname: str,
+        port: int,
+        username: str,
+        password: str | None,
+        private_key_path: str | None,
+        sock: Any = None,
+    ) -> None:
+        if private_key_path:
+            expanded_private_key_path = Path(private_key_path).expanduser()
+            if not expanded_private_key_path.exists():
+                raise FileNotFoundError(
+                    f"Private key file not found: {expanded_private_key_path}"
+                )
+            key = await self._run_blocking(
+                self._load_private_key, expanded_private_key_path
+            )
+            await self._run_blocking(
+                client.connect,
+                hostname,
+                port=port,
+                username=username,
+                pkey=key,
+                timeout=DEFAULT_CONNECT_TIMEOUT,
+                allow_agent=False,
+                look_for_keys=False,
+                sock=sock,
+            )
+            return
+
+        if password:
+            await self._run_blocking(
+                client.connect,
+                hostname,
+                port=port,
+                username=username,
+                password=password,
+                timeout=DEFAULT_CONNECT_TIMEOUT,
+                allow_agent=False,
+                look_for_keys=False,
+                sock=sock,
+            )
+            return
+
+        raise ValueError("Either password or private_key_path must be provided")
+
+    async def _open_ssh_clients(
+        self,
+        *,
+        hostname: str,
+        port: int,
+        username: str,
+        password: str | None,
+        private_key_path: str | None,
+        known_hosts_path: str | None,
+        trust_unknown_host: bool,
+        jump_host: Dict[str, Any] | None,
+    ) -> tuple[paramiko.SSHClient, paramiko.SSHClient | None, str | None]:
+        jump_client: paramiko.SSHClient | None = None
+        client: paramiko.SSHClient | None = None
+        jump_description: str | None = None
+
+        try:
+            if jump_host:
+                jump_client = self._build_client(known_hosts_path, trust_unknown_host)
+                await self._connect_with_auth(
+                    jump_client,
+                    hostname=jump_host["hostname"],
+                    port=jump_host["port"],
+                    username=jump_host["username"],
+                    password=jump_host.get("password"),
+                    private_key_path=jump_host.get("private_key_path"),
+                )
+                if trust_unknown_host:
+                    await self._run_blocking(
+                        self._persist_trusted_host_keys, jump_client
+                    )
+
+                jump_description = (
+                    f"{jump_host['username']}@{jump_host['hostname']}:{jump_host['port']}"
+                )
+                transport = jump_client.get_transport()
+                if transport is None or not transport.is_active():
+                    raise RuntimeError("Jump host transport is not active")
+
+                client = self._build_client(known_hosts_path, trust_unknown_host)
+                jump_channel = await self._run_blocking(
+                    transport.open_channel,
+                    "direct-tcpip",
+                    (hostname, port),
+                    ("127.0.0.1", 0),
+                )
+                await self._connect_with_auth(
+                    client,
+                    hostname=hostname,
+                    port=port,
+                    username=username,
+                    password=password,
+                    private_key_path=private_key_path,
+                    sock=jump_channel,
+                )
+                if trust_unknown_host:
+                    await self._run_blocking(self._persist_trusted_host_keys, client)
+                return client, jump_client, jump_description
+
+            client = self._build_client(known_hosts_path, trust_unknown_host)
+            await self._connect_with_auth(
+                client,
+                hostname=hostname,
+                port=port,
+                username=username,
+                password=password,
+                private_key_path=private_key_path,
+            )
+            if trust_unknown_host:
+                await self._run_blocking(self._persist_trusted_host_keys, client)
+            return client, None, None
+        except Exception:
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+            if jump_client is not None:
+                try:
+                    jump_client.close()
+                except Exception:
+                    pass
+            raise
 
     def _build_client(self, known_hosts_path: str | None, trust_unknown_host: bool):
         client = paramiko.SSHClient()
@@ -457,6 +635,33 @@ class SSHMCPServer:
                             "credential_name": {
                                 "type": "string",
                                 "description": "Name to use when saving credentials locally. Defaults to connection_name or hostname."
+                            },
+                            "jump_host": {
+                                "type": "object",
+                                "description": "Optional SSH jump host (bastion) used to reach the target via native SSH tunneling",
+                                "properties": {
+                                    "hostname": {
+                                        "type": "string",
+                                        "description": "Jump host hostname or IP address"
+                                    },
+                                    "username": {
+                                        "type": "string",
+                                        "description": "Jump host SSH username"
+                                    },
+                                    "password": {
+                                        "type": "string",
+                                        "description": "Jump host SSH password"
+                                    },
+                                    "private_key_path": {
+                                        "type": "string",
+                                        "description": "Path to the jump host private key"
+                                    },
+                                    "port": {
+                                        "type": "integer",
+                                        "description": "Jump host SSH port (default: 22)",
+                                        "default": 22
+                                    }
+                                }
                             }
                         }
                     }
@@ -616,6 +821,33 @@ class SSHMCPServer:
                                 "type": "boolean",
                                 "description": "Allow connecting to hosts not present in known_hosts. Defaults to false.",
                                 "default": False
+                            },
+                            "jump_host": {
+                                "type": "object",
+                                "description": "Optional SSH jump host (bastion) used to reach the target via native SSH tunneling",
+                                "properties": {
+                                    "hostname": {
+                                        "type": "string",
+                                        "description": "Jump host hostname or IP address"
+                                    },
+                                    "username": {
+                                        "type": "string",
+                                        "description": "Jump host SSH username"
+                                    },
+                                    "password": {
+                                        "type": "string",
+                                        "description": "Jump host SSH password"
+                                    },
+                                    "private_key_path": {
+                                        "type": "string",
+                                        "description": "Path to the jump host private key"
+                                    },
+                                    "port": {
+                                        "type": "integer",
+                                        "description": "Jump host SSH port (default: 22)",
+                                        "default": 22
+                                    }
+                                }
                             }
                         },
                         "required": ["name", "hostname", "username"]
@@ -748,6 +980,11 @@ class SSHMCPServer:
         connection_name = merged.get("connection_name", hostname)
         known_hosts_path = merged.get("known_hosts_path")
         trust_unknown_host = merged.get("trust_unknown_host", False)
+        try:
+            jump_host = self._normalize_jump_host(merged.get("jump_host"))
+        except ValueError as e:
+            return [TextContent(type="text", text=str(e))]
+        jump_host_uses_password = bool(jump_host and jump_host.get("password"))
         direct_credentials_provided = (
             bool(args.get("password")) or bool(args.get("private_key_path"))
         )
@@ -759,6 +996,8 @@ class SSHMCPServer:
                 and direct_credentials_provided
                 and not saved_credential_name
             )
+        if jump_host_uses_password:
+            save_credentials = False
         credential_name = args.get("credential_name") or connection_name
         used_password_auth = bool(password) and not private_key_path
 
@@ -766,45 +1005,16 @@ class SSHMCPServer:
             return [TextContent(type="text", text=f"Connection '{connection_name}' already exists")]
 
         try:
-            client = self._build_client(known_hosts_path, trust_unknown_host)
-
-            # Determine authentication method
-            if private_key_path:
-                private_key_path = Path(private_key_path).expanduser()
-                if not private_key_path.exists():
-                    return [TextContent(type="text", text=f"Private key file not found: {private_key_path}")]
-
-                try:
-                    key = await self._run_blocking(self._load_private_key, private_key_path)
-                except RuntimeError as e:
-                    return [TextContent(type="text", text=str(e))]
-
-                await self._run_blocking(
-                    client.connect,
-                    hostname,
-                    port=port,
-                    username=username,
-                    pkey=key,
-                    timeout=DEFAULT_CONNECT_TIMEOUT,
-                    allow_agent=False,
-                    look_for_keys=False,
-                )
-            elif password:
-                await self._run_blocking(
-                    client.connect,
-                    hostname,
-                    port=port,
-                    username=username,
-                    password=password,
-                    timeout=DEFAULT_CONNECT_TIMEOUT,
-                    allow_agent=False,
-                    look_for_keys=False,
-                )
-            else:
-                return [TextContent(type="text", text="Either password or private_key_path must be provided")]
-
-            if trust_unknown_host:
-                await self._run_blocking(self._persist_trusted_host_keys, client)
+            client, jump_client, jump_description = await self._open_ssh_clients(
+                hostname=hostname,
+                port=port,
+                username=username,
+                password=password,
+                private_key_path=private_key_path,
+                known_hosts_path=known_hosts_path,
+                trust_unknown_host=trust_unknown_host,
+                jump_host=jump_host,
+            )
 
             # Test the connection
             try:
@@ -821,6 +1031,9 @@ class SSHMCPServer:
                 hostname=hostname,
                 username=username,
                 port=port,
+                jump_client=jump_client,
+                jump_description=jump_description,
+                jump_host=jump_host,
                 known_hosts_path=known_hosts_path,
                 connected=True
             )
@@ -845,6 +1058,7 @@ class SSHMCPServer:
                         key_comment=f"{username}@{hostname} via ssh-mcp",
                         known_hosts_path=known_hosts_path,
                         overwrite_saved_credential=True,
+                        jump_host=jump_host,
                     )
                     status_suffix = (
                         f" Installed SSH public key and saved key-based credential "
@@ -862,6 +1076,11 @@ class SSHMCPServer:
                     " Password authentication was used for this live session only. "
                     "No reusable credential was saved."
                 )
+                if jump_host_uses_password:
+                    status_suffix = (
+                        " Password-backed jump host authentication was used for this "
+                        "live session only. No reusable credential was saved."
+                    )
             elif save_credentials:
                 self._save_key_credential(
                     credential_name,
@@ -870,8 +1089,12 @@ class SSHMCPServer:
                     private_key_path=private_key_path,
                     port=port,
                     known_hosts_path=known_hosts_path,
+                    jump_host=jump_host,
                 )
                 status_suffix = f" Saved key-based credential '{credential_name}' locally."
+
+            if jump_description:
+                status_suffix += f" Connected through jump host {jump_description}."
 
             return [TextContent(
                 type="text",
@@ -892,6 +1115,8 @@ class SSHMCPServer:
                     "Update your known_hosts entry or pass trust_unknown_host=true to trust on first use and pin the host key locally."
                 ),
             )]
+        except FileNotFoundError as e:
+            return [TextContent(type="text", text=str(e))]
         except paramiko.SSHException as e:
             return [TextContent(
                 type="text",
@@ -952,6 +1177,7 @@ class SSHMCPServer:
                 key_comment=key_comment,
                 known_hosts_path=connection.known_hosts_path,
                 overwrite_saved_credential=overwrite_saved_credential,
+                jump_host=connection.jump_host,
             )
 
             return [TextContent(
@@ -1099,6 +1325,8 @@ class SSHMCPServer:
         try:
             connection = self.connections[connection_name]
             await self._run_blocking(connection.client.close)
+            if connection.jump_client is not None:
+                await self._run_blocking(connection.jump_client.close)
             connection.connected = False
             del self.connections[connection_name]
 
@@ -1120,6 +1348,18 @@ class SSHMCPServer:
         port = args.get("port", 22)
         known_hosts_path = args.get("known_hosts_path")
         trust_unknown_host = args.get("trust_unknown_host", False)
+        try:
+            jump_host = self._normalize_jump_host(args.get("jump_host"))
+        except ValueError as e:
+            return [TextContent(type="text", text=str(e))]
+        if jump_host and jump_host.get("password"):
+            return [TextContent(
+                type="text",
+                text=(
+                    "Saved credentials do not support password-backed jump hosts. "
+                    "Use jump_host.private_key_path or connect with ssh_connect for a live session only."
+                ),
+            )]
 
         if not password and not private_key_path:
             return [TextContent(
@@ -1148,6 +1388,7 @@ class SSHMCPServer:
                     private_key_path=private_key.resolve(strict=False),
                     port=port,
                     known_hosts_path=known_hosts_path,
+                    jump_host=jump_host,
                 )
                 return [TextContent(
                     type="text",
@@ -1157,20 +1398,19 @@ class SSHMCPServer:
                     ),
                 )]
 
-            client = self._build_client(known_hosts_path, trust_unknown_host)
+            client = None
+            jump_client = None
             try:
-                await self._run_blocking(
-                    client.connect,
-                    hostname,
+                client, jump_client, _ = await self._open_ssh_clients(
+                    hostname=hostname,
                     port=port,
                     username=username,
                     password=password,
-                    timeout=DEFAULT_CONNECT_TIMEOUT,
-                    allow_agent=False,
-                    look_for_keys=False,
+                    private_key_path=None,
+                    known_hosts_path=known_hosts_path,
+                    trust_unknown_host=trust_unknown_host,
+                    jump_host=jump_host,
                 )
-                if trust_unknown_host:
-                    await self._run_blocking(self._persist_trusted_host_keys, client)
                 await self._bootstrap_key_auth(
                     client=client,
                     hostname=hostname,
@@ -1181,9 +1421,13 @@ class SSHMCPServer:
                     key_comment=f"{username}@{hostname} via ssh-mcp",
                     known_hosts_path=known_hosts_path,
                     overwrite_saved_credential=True,
+                    jump_host=jump_host,
                 )
             finally:
-                await self._run_blocking(client.close)
+                if client is not None:
+                    await self._run_blocking(client.close)
+                if jump_client is not None:
+                    await self._run_blocking(jump_client.close)
         except paramiko.AuthenticationException:
             return [TextContent(type="text", text="Authentication failed - check username/password or key")]
         except paramiko.BadHostKeyException as e:
@@ -1230,9 +1474,16 @@ class SSHMCPServer:
                 if entry["has_password"]
                 else "private key"
             )
+            jump_host = entry.get("jump_host")
+            jump_suffix = ""
+            if jump_host:
+                jump_suffix = (
+                    f" via {jump_host.get('username')}@{jump_host.get('hostname')}:"
+                    f"{jump_host.get('port', 22)}"
+                )
             lines.append(
                 f"- {entry['name']}: {entry['username']}@{entry['hostname']}:{entry['port']} "
-                f"({auth_mode})"
+                f"({auth_mode}){jump_suffix}"
             )
 
         return [TextContent(type="text", text="\n".join(lines))]
@@ -1259,7 +1510,11 @@ class SSHMCPServer:
         for name, conn in self.connections.items():
             status = "Connected" if conn.connected else "Disconnected"
             last_used = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(conn.last_used))
-            result += f"- {name}: {conn.username}@{conn.hostname}:{conn.port} ({status}) - Last used: {last_used}\n"
+            jump_suffix = f" via {conn.jump_description}" if conn.jump_description else ""
+            result += (
+                f"- {name}: {conn.username}@{conn.hostname}:{conn.port}{jump_suffix} "
+                f"({status}) - Last used: {last_used}\n"
+            )
 
         return [TextContent(type="text", text=result)]
 

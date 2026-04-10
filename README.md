@@ -36,6 +36,7 @@ SSH remote access for MCP-compatible clients through Model Context Protocol (MCP
 
 - Works with MCP-compatible clients on Windows and Linux
 - Connect to remote servers via SSH
+- Native SSH jump-host / bastion support
 - Execute commands remotely
 - Upload/download files via SFTP
 - Manage multiple connections
@@ -69,6 +70,26 @@ ssh saved-name
 ```
 After the first successful setup, just use the saved credential name to connect again.
 
+### Connect through a jump host:
+Use the `jump_host` object on `ssh_connect` or `ssh_save_credentials`:
+
+```json
+{
+  "hostname": "10.0.2.15",
+  "username": "ubuntu",
+  "private_key_path": "~/.ssh/id_ed25519",
+  "jump_host": {
+    "hostname": "203.0.113.10",
+    "username": "bastion",
+    "private_key_path": "~/.ssh/id_ed25519",
+    "port": 22
+  }
+}
+```
+
+This uses a native SSH tunnel to the target host and saved credentials retain the same jump-host configuration.
+For reusable saved credentials, the jump host must use `private_key_path` rather than a password.
+
 ### Execute commands:
 ```
 List files in /home directory on my server
@@ -101,6 +122,7 @@ Version `1.0.1` adds safer and more practical day-to-day SSH workflows:
 - Direct logins still save reusable credentials by default, but `save_credentials=false` now cleanly opts out for password sessions too
 - Saved credential flows now include connect, save, list, delete, and manual key setup helpers
 - Host trust and file transfer rules are stricter, with local root restrictions and trust-on-first-use host pinning
+- Native jump-host connections are supported for both live sessions and saved credentials
 - Saved credentials are key-based, so no master password is required for normal use
 - Manually saved private key paths are validated when you save them, not later on first connect
 
