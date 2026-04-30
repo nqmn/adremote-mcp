@@ -117,6 +117,8 @@ class CredentialStore:
                 "Connect once with a password to bootstrap a key, or save a private key path."
             )
 
+        stored.pop("private_key_passphrase", None)
+
         data["credentials"][name] = stored
         self._write(data)
 
@@ -274,12 +276,22 @@ class SSHMCPServer:
             if key_class is not None
         ]
 
-    def _load_private_key(self, private_key_path: Path):
+    def _load_private_key(self, private_key_path: Path, passphrase: str | None = None):
         for key_class in self._private_key_classes():
             try:
-                return key_class.from_private_key_file(str(private_key_path))
+                return key_class.from_private_key_file(
+                    str(private_key_path), password=passphrase
+                )
             except paramiko.PasswordRequiredException as exc:
-                raise RuntimeError("Private key requires a passphrase (not supported)") from exc
+                raise RuntimeError(
+                    "Private key requires a passphrase — supply private_key_passphrase"
+                ) from exc
+            except paramiko.ssh_exception.SSHException as exc:
+                if passphrase is not None and "not a valid" not in str(exc).lower():
+                    raise RuntimeError(
+                        "Failed to decrypt private key — check private_key_passphrase"
+                    ) from exc
+                continue
             except Exception:
                 continue
 
@@ -437,6 +449,7 @@ class SSHMCPServer:
         username: str,
         password: str | None,
         private_key_path: str | None,
+        private_key_passphrase: str | None = None,
         sock: Any = None,
     ) -> None:
         if private_key_path:
@@ -446,7 +459,7 @@ class SSHMCPServer:
                     f"Private key file not found: {expanded_private_key_path}"
                 )
             key = await self._run_blocking(
-                self._load_private_key, expanded_private_key_path
+                self._load_private_key, expanded_private_key_path, private_key_passphrase
             )
             await self._run_blocking(
                 client.connect,
@@ -485,6 +498,7 @@ class SSHMCPServer:
         username: str,
         password: str | None,
         private_key_path: str | None,
+        private_key_passphrase: str | None = None,
         known_hosts_path: str | None,
         trust_unknown_host: bool,
         jump_host: Dict[str, Any] | None,
@@ -503,6 +517,7 @@ class SSHMCPServer:
                     username=jump_host["username"],
                     password=jump_host.get("password"),
                     private_key_path=jump_host.get("private_key_path"),
+                    private_key_passphrase=jump_host.get("private_key_passphrase"),
                 )
                 if trust_unknown_host:
                     await self._run_blocking(
@@ -530,6 +545,7 @@ class SSHMCPServer:
                     username=username,
                     password=password,
                     private_key_path=private_key_path,
+                    private_key_passphrase=private_key_passphrase,
                     sock=jump_channel,
                 )
                 if trust_unknown_host:
@@ -544,6 +560,7 @@ class SSHMCPServer:
                 username=username,
                 password=password,
                 private_key_path=private_key_path,
+                private_key_passphrase=private_key_passphrase,
             )
             if trust_unknown_host:
                 await self._run_blocking(self._persist_trusted_host_keys, client)
@@ -604,6 +621,10 @@ class SSHMCPServer:
                                 "type": "string",
                                 "description": "Path to private key file (optional)"
                             },
+                            "private_key_passphrase": {
+                                "type": "string",
+                                "description": "Passphrase for an encrypted private key. Never stored in saved credentials."
+                            },
                             "port": {
                                 "type": "integer",
                                 "description": "SSH port (default: 22)",
@@ -656,6 +677,10 @@ class SSHMCPServer:
                                         "type": "string",
                                         "description": "Path to the jump host private key"
                                     },
+                                    "private_key_passphrase": {
+                                        "type": "string",
+                                        "description": "Passphrase for an encrypted jump host private key. Never stored."
+                                    },
                                     "port": {
                                         "type": "integer",
                                         "description": "Jump host SSH port (default: 22)",
@@ -679,6 +704,10 @@ class SSHMCPServer:
                             "connection_name": {
                                 "type": "string",
                                 "description": "Optional active connection name override"
+                            },
+                            "private_key_passphrase": {
+                                "type": "string",
+                                "description": "Passphrase for the saved credential's encrypted private key. Never stored."
                             }
                         },
                         "required": ["name"]
@@ -808,6 +837,10 @@ class SSHMCPServer:
                                 "type": "string",
                                 "description": "Path to private key file (optional)"
                             },
+                            "private_key_passphrase": {
+                                "type": "string",
+                                "description": "Passphrase to decrypt an encrypted private key for validation. Never stored."
+                            },
                             "port": {
                                 "type": "integer",
                                 "description": "SSH port (default: 22)",
@@ -841,6 +874,10 @@ class SSHMCPServer:
                                     "private_key_path": {
                                         "type": "string",
                                         "description": "Path to the jump host private key"
+                                    },
+                                    "private_key_passphrase": {
+                                        "type": "string",
+                                        "description": "Passphrase for an encrypted jump host private key. Never stored."
                                     },
                                     "port": {
                                         "type": "integer",
@@ -976,6 +1013,7 @@ class SSHMCPServer:
 
         password = merged.get("password")
         private_key_path = merged.get("private_key_path")
+        private_key_passphrase = merged.get("private_key_passphrase")
         port = merged.get("port", 22)
         connection_name = merged.get("connection_name", hostname)
         known_hosts_path = merged.get("known_hosts_path")
@@ -1011,6 +1049,7 @@ class SSHMCPServer:
                 username=username,
                 password=password,
                 private_key_path=private_key_path,
+                private_key_passphrase=private_key_passphrase,
                 known_hosts_path=known_hosts_path,
                 trust_unknown_host=trust_unknown_host,
                 jump_host=jump_host,
@@ -1135,6 +1174,8 @@ class SSHMCPServer:
         }
         if args.get("connection_name"):
             connect_args["connection_name"] = args["connection_name"]
+        if args.get("private_key_passphrase"):
+            connect_args["private_key_passphrase"] = args["private_key_passphrase"]
         return await self._ssh_connect(connect_args)
 
     async def _ssh_setup_key_auth(self, args: Dict[str, Any]) -> List[TextContent]:
@@ -1367,6 +1408,8 @@ class SSHMCPServer:
                 text="Either password or private_key_path must be provided to save credentials",
             )]
 
+        private_key_passphrase = args.get("private_key_passphrase")
+
         try:
             if private_key_path:
                 private_key = Path(private_key_path).expanduser()
@@ -1377,7 +1420,9 @@ class SSHMCPServer:
                     )]
 
                 try:
-                    await self._run_blocking(self._load_private_key, private_key)
+                    await self._run_blocking(
+                        self._load_private_key, private_key, private_key_passphrase
+                    )
                 except RuntimeError as e:
                     return [TextContent(type="text", text=str(e))]
 
@@ -1390,11 +1435,16 @@ class SSHMCPServer:
                     known_hosts_path=known_hosts_path,
                     jump_host=jump_host,
                 )
+                passphrase_note = (
+                    " The passphrase is not stored — supply private_key_passphrase each time."
+                    if private_key_passphrase
+                    else ""
+                )
                 return [TextContent(
                     type="text",
                     text=(
                         f"Saved key-based credential '{name}' locally in "
-                        f"{self.credential_store.store_path}."
+                        f"{self.credential_store.store_path}.{passphrase_note}"
                     ),
                 )]
 
@@ -1578,7 +1628,7 @@ class SSHMCPServer:
                 write_stream,
                 InitializationOptions(
                     server_name="ssh-mcp-server",
-                    server_version="1.0.1",
+                    server_version="1.0.2",
                     capabilities=ServerCapabilities(
                         tools=ToolsCapability()
                     )
