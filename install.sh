@@ -1,21 +1,24 @@
-#!/bin/bash
+#!/usr/bin/env sh
+set -eu
 
 # SSH MCP Server Installation Script
 
-echo "Installing SSH MCP Server..."
+VENV_DIR="${VENV_DIR:-.venv-linux}"
+
+echo "Installing SSH MCP Server for WSL/Linux..."
 
 # Create virtual environment
-echo "Creating virtual environment..."
-python3 -m venv venv
+echo "Creating virtual environment: $VENV_DIR"
+python3 -m venv "$VENV_DIR"
 
 # Install dependencies using virtual environment pip
 echo "Installing dependencies..."
-./venv/bin/pip install paramiko mcp
+"$VENV_DIR/bin/python" -m pip install -r requirements.txt
 
 echo "Installation complete!"
 echo ""
 echo "To activate the virtual environment, run:"
-echo "source venv/bin/activate"
+echo ". $VENV_DIR/bin/activate"
 echo ""
 echo "To run the server:"
-echo "./venv/bin/python ssh_mcp_server.py"
+echo "$VENV_DIR/bin/python ssh_mcp_server.py"

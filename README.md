@@ -163,7 +163,7 @@ or via tool parameters:
   "private_key_passphrase": "mysecret"
 }
 ```
-The passphrase is used only in memory and is never written to disk. If a saved credential points to an encrypted key, supply `private_key_passphrase` each time you call `ssh_connect_saved`.
+The passphrase is stored alongside the saved credential so future calls to `ssh_connect_saved` do not require it again. You can still supply `private_key_passphrase` on `ssh_connect_saved` to override the stored value for a single session.
 
 ### Connect through a jump host:
 Use the `jump_host` object on `ssh_connect` or `ssh_save_credentials`:
@@ -214,11 +214,17 @@ Show me all active SSH connections
 
 ## Latest Update
 
+Version `1.0.3` persists the private key passphrase in saved credentials:
+
+- `private_key_passphrase` is now stored in the credential file when saving via `ssh_connect` or `ssh_save_credentials`
+- `ssh_connect_saved` uses the stored passphrase automatically — no need to supply it on every call
+- Supplying `private_key_passphrase` on `ssh_connect_saved` overrides the stored value for that session only
+- `ssh_list_saved_credentials` shows `private key (passphrase saved)` when a passphrase is stored
+
 Version `1.0.2` adds support for passphrase-protected (encrypted) private keys:
 
 - `private_key_passphrase` accepted on `ssh_connect`, `ssh_connect_saved`, and `ssh_save_credentials`
 - Applies to both the target host key and the jump host key
-- The passphrase is used only in memory — it is never written to the credential store
 - Clear error messages when a key is encrypted but no passphrase is supplied, or when the passphrase is wrong
 
 Version `1.0.1` adds safer and more practical day-to-day SSH workflows:

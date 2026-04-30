@@ -1,4 +1,7 @@
 /.venv
+/.venv-win
+/.venv-linux
+/venv
 /__pycache__
 .codex
 CLAUDE.md

@@ -117,8 +117,6 @@ class CredentialStore:
                 "Connect once with a password to bootstrap a key, or save a private key path."
             )
 
-        stored.pop("private_key_passphrase", None)
-
         data["credentials"][name] = stored
         self._write(data)
 
@@ -156,6 +154,7 @@ class CredentialStore:
                     "jump_host": stored.get("jump_host"),
                     "has_password": bool(stored.get("password")),
                     "has_private_key_path": bool(stored.get("private_key_path")),
+                    "has_private_key_passphrase": bool(stored.get("private_key_passphrase")),
                 }
             )
         return entries
@@ -347,6 +346,7 @@ class SSHMCPServer:
         private_key_path: Path,
         port: int,
         known_hosts_path: str | None,
+        private_key_passphrase: str | None = None,
         jump_host: Dict[str, Any] | None = None,
     ) -> None:
         stored_jump_host = None
@@ -361,18 +361,18 @@ class SSHMCPServer:
                 for key, value in jump_host.items()
                 if key != "password"
             }
-        self.credential_store.save(
-            credential_name,
-            {
-                "hostname": hostname,
-                "username": username,
-                "private_key_path": str(private_key_path),
-                "port": port,
-                "known_hosts_path": known_hosts_path,
-                "trust_unknown_host": False,
-                "jump_host": stored_jump_host,
-            },
-        )
+        payload: Dict[str, Any] = {
+            "hostname": hostname,
+            "username": username,
+            "private_key_path": str(private_key_path),
+            "port": port,
+            "known_hosts_path": known_hosts_path,
+            "trust_unknown_host": False,
+            "jump_host": stored_jump_host,
+        }
+        if private_key_passphrase:
+            payload["private_key_passphrase"] = private_key_passphrase
+        self.credential_store.save(credential_name, payload)
 
     async def _bootstrap_key_auth(
         self,
@@ -623,7 +623,7 @@ class SSHMCPServer:
                             },
                             "private_key_passphrase": {
                                 "type": "string",
-                                "description": "Passphrase for an encrypted private key. Never stored in saved credentials."
+                                "description": "Passphrase for an encrypted private key. Stored in saved credentials when save_credentials is true."
                             },
                             "port": {
                                 "type": "integer",
@@ -707,7 +707,7 @@ class SSHMCPServer:
                             },
                             "private_key_passphrase": {
                                 "type": "string",
-                                "description": "Passphrase for the saved credential's encrypted private key. Never stored."
+                                "description": "Passphrase override for the saved credential's encrypted private key. If the saved credential already has a passphrase, this overrides it for this session only."
                             }
                         },
                         "required": ["name"]
@@ -839,7 +839,7 @@ class SSHMCPServer:
                             },
                             "private_key_passphrase": {
                                 "type": "string",
-                                "description": "Passphrase to decrypt an encrypted private key for validation. Never stored."
+                                "description": "Passphrase for an encrypted private key. Stored alongside the credential."
                             },
                             "port": {
                                 "type": "integer",
@@ -1128,9 +1128,11 @@ class SSHMCPServer:
                     private_key_path=private_key_path,
                     port=port,
                     known_hosts_path=known_hosts_path,
+                    private_key_passphrase=private_key_passphrase,
                     jump_host=jump_host,
                 )
-                status_suffix = f" Saved key-based credential '{credential_name}' locally."
+                passphrase_note = " Passphrase saved." if private_key_passphrase else ""
+                status_suffix = f" Saved key-based credential '{credential_name}' locally.{passphrase_note}"
 
             if jump_description:
                 status_suffix += f" Connected through jump host {jump_description}."
@@ -1433,13 +1435,10 @@ class SSHMCPServer:
                     private_key_path=private_key.resolve(strict=False),
                     port=port,
                     known_hosts_path=known_hosts_path,
+                    private_key_passphrase=private_key_passphrase,
                     jump_host=jump_host,
                 )
-                passphrase_note = (
-                    " The passphrase is not stored — supply private_key_passphrase each time."
-                    if private_key_passphrase
-                    else ""
-                )
+                passphrase_note = " Passphrase saved." if private_key_passphrase else ""
                 return [TextContent(
                     type="text",
                     text=(
@@ -1519,11 +1518,12 @@ class SSHMCPServer:
 
         lines = [f"Saved SSH credentials ({self.credential_store.store_path}):"]
         for entry in entries:
-            auth_mode = (
-                "legacy password entry (unsupported)"
-                if entry["has_password"]
-                else "private key"
-            )
+            if entry["has_password"]:
+                auth_mode = "legacy password entry (unsupported)"
+            elif entry.get("has_private_key_passphrase"):
+                auth_mode = "private key (passphrase saved)"
+            else:
+                auth_mode = "private key"
             jump_host = entry.get("jump_host")
             jump_suffix = ""
             if jump_host:
