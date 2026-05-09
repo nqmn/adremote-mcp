@@ -9,69 +9,74 @@ server. Do not share one `venv` between Windows and WSL/Linux.
 
 ### Windows
 
-1. **Install**:
-   ```powershell
-   .\install.ps1
-   ```
+```powershell
+irm https://raw.githubusercontent.com/nqmn/adremote-mcp/main/install.ps1 | iex
+```
 
-2. **Add the MCP in Claude Desktop, Claude Code, or Codex**:
-   ```json
-   {
-     "mcpServers": {
-       "ssh-remote": {
-         "command": "C:\\Users\\Intel\\Desktop\\adremote-mcp\\.venv-win\\Scripts\\python.exe",
-         "args": [
-           "C:\\Users\\Intel\\Desktop\\adremote-mcp\\ssh_mcp_server.py"
-         ]
-       }
-     }
-   }
-   ```
+The installer clones the repo into `%USERPROFILE%\adremote-mcp`, creates `.venv-win`, and prints the exact paths to paste into your MCP config.
 
-   If you already have a Windows Python with `paramiko` and `mcp` installed,
-   you can use that interpreter directly instead of `.venv-win`.
+To install into a custom directory:
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/nqmn/adremote-mcp/main/install.ps1))) -InstallDir "C:\tools\adremote-mcp"
+```
 
-### WSL/Linux
+### WSL / Linux
 
-1. **Install**:
-   ```bash
-   ./install.sh
-   ```
+```bash
+curl -fsSL https://raw.githubusercontent.com/nqmn/adremote-mcp/main/install.sh | bash
+```
 
-2. **Add the MCP in Claude Desktop, Claude Code, or Codex**:
-   ```json
-   {
-     "mcpServers": {
-       "ssh-remote": {
-         "command": "/home/user/adremote-mcp/.venv-linux/bin/python",
-         "args": [
-           "/home/user/adremote-mcp/ssh_mcp_server.py"
-         ]
-       }
-     }
-   }
-   ```
+The installer clones the repo into `~/adremote-mcp`, creates `.venv-linux`, and prints the exact paths to paste into your MCP config.
 
-   If the repo is accessed through WSL from the Windows drive, use the WSL path:
-   ```json
-   {
-     "mcpServers": {
-       "ssh-remote": {
-         "command": "/mnt/c/Users/Intel/Desktop/adremote-mcp/.venv-linux/bin/python",
-         "args": [
-           "/mnt/c/Users/Intel/Desktop/adremote-mcp/ssh_mcp_server.py"
-         ]
-       }
-     }
-   }
-   ```
+To install into a custom directory:
+```bash
+ADREMOTE_DIR=/opt/adremote-mcp curl -fsSL https://raw.githubusercontent.com/nqmn/adremote-mcp/main/install.sh | bash
+```
+
+### Already cloned the repo?
+
+Run the installer directly from the repo root — it detects `ssh_mcp_server.py` and installs in place:
+
+```powershell
+.\install.ps1          # Windows
+```
+```bash
+./install.sh           # WSL/Linux
+```
+
+### MCP config (after install)
+
+The installer prints the exact paths. General form:
+
+```json
+{
+  "mcpServers": {
+    "ssh-remote": {
+      "command": "/home/user/adremote-mcp/.venv-linux/bin/python",
+      "args": ["/home/user/adremote-mcp/ssh_mcp_server.py"]
+    }
+  }
+}
+```
+
+Windows example:
+```json
+{
+  "mcpServers": {
+    "ssh-remote": {
+      "command": "C:\\Users\\YourName\\adremote-mcp\\.venv-win\\Scripts\\python.exe",
+      "args": ["C:\\Users\\YourName\\adremote-mcp\\ssh_mcp_server.py"]
+    }
+  }
+}
+```
 
 ### Portable Launchers
 
 You can also point an MCP client at the included launcher for the matching OS:
 
-- Windows: `C:\Users\Intel\Desktop\adremote-mcp\run-ssh-mcp.cmd`
-- WSL/Linux: `/path/to/adremote-mcp/run-ssh-mcp.sh`
+- Windows: `<install-dir>\run-ssh-mcp.cmd`
+- WSL/Linux: `<install-dir>/run-ssh-mcp.sh`
 
 The launchers prefer the OS-specific venv and then fall back to `python3` or
 `python`. On Windows, `SSH_MCP_PYTHON` can be set to force a specific Python

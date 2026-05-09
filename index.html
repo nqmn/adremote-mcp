@@ -98,7 +98,7 @@
     <nav class="fixed top-0 w-full z-50 glass-panel border-b border-white/5">
         <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
             <div class="flex items-center justify-between h-16">
-                <div class="flex items-center gap-2 cursor-pointer">
+                <div class="flex items-center gap-2">
                     <i data-lucide="terminal" class="w-6 h-6 text-brand-400"></i>
                     <span class="font-bold text-xl tracking-tight">adremote-mcp</span>
                 </div>
@@ -113,21 +113,30 @@
                         Get Started
                     </a>
                 </div>
-                <button id="mobile-menu-button" class="md:hidden inline-flex items-center justify-center p-2 rounded-lg border border-white/10 bg-white/5 text-gray-200 hover:bg-white/10 transition-colors" aria-label="Open navigation menu" aria-expanded="false" aria-controls="mobile-menu" onclick="toggleMobileMenu()">
-                    <i data-lucide="menu" class="w-5 h-5"></i>
+                <button id="mobile-menu-button" onclick="toggleMobileMenu()" class="md:hidden flex items-center justify-center w-10 h-10 rounded-lg border border-white/10 bg-white/5 text-gray-200 hover:bg-white/10 transition-colors" aria-label="Toggle menu">
+                    <svg id="icon-menu" xmlns="http://www.w3.org/2000/svg" class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                        <path stroke-linecap="round" stroke-linejoin="round" d="M4 6h16M4 12h16M4 18h16"/>
+                    </svg>
+                    <svg id="icon-close" xmlns="http://www.w3.org/2000/svg" class="w-5 h-5 hidden" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                        <path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12"/>
+                    </svg>
                 </button>
             </div>
-            <div id="mobile-menu" class="mobile-menu md:hidden">
-                <div class="pb-4 flex flex-col gap-2 text-sm font-medium text-gray-300">
-                    <a href="#terminal" class="px-3 py-2 rounded-lg hover:bg-white/5 transition-colors" onclick="closeMobileMenu()">See how it works</a>
-                    <a href="#tools" class="px-3 py-2 rounded-lg hover:bg-white/5 transition-colors" onclick="closeMobileMenu()">Tools</a>
-                    <a href="#faq" class="px-3 py-2 rounded-lg hover:bg-white/5 transition-colors" onclick="closeMobileMenu()">FAQ</a>
-                    <a href="https://github.com/nqmn/adremote-mcp/blob/main/README.md" target="_blank" rel="noreferrer" class="px-3 py-2 rounded-lg hover:bg-white/5 transition-colors" onclick="closeMobileMenu()">Docs</a>
-                    <a href="https://github.com/nqmn/adremote-mcp" target="_blank" rel="noreferrer" class="px-3 py-2 rounded-lg hover:bg-white/5 transition-colors" onclick="closeMobileMenu()">GitHub</a>
-                    <a href="#install" class="mt-2 bg-white/10 hover:bg-white/20 text-white px-4 py-3 rounded-lg transition-all border border-white/10 text-center" onclick="closeMobileMenu()">
-                        Get Started
-                    </a>
-                </div>
+        </div>
+
+        <!-- Mobile dropdown — full width below the bar -->
+        <div id="mobile-menu" class="md:hidden hidden border-t border-white/5 bg-[#0f1115]">
+            <div class="max-w-7xl mx-auto px-4 py-3 flex flex-col gap-1 text-sm font-medium text-gray-300">
+                <a href="#how-it-works" onclick="closeMobileMenu()" class="px-3 py-2.5 rounded-lg hover:bg-white/5 transition-colors">See how it works</a>
+                <a href="#tools" onclick="closeMobileMenu()" class="px-3 py-2.5 rounded-lg hover:bg-white/5 transition-colors">Tools</a>
+                <a href="#faq" onclick="closeMobileMenu()" class="px-3 py-2.5 rounded-lg hover:bg-white/5 transition-colors">FAQ</a>
+                <a href="https://github.com/nqmn/adremote-mcp/blob/main/README.md" target="_blank" rel="noreferrer" onclick="closeMobileMenu()" class="px-3 py-2.5 rounded-lg hover:bg-white/5 transition-colors">Docs</a>
+                <a href="https://github.com/nqmn/adremote-mcp" target="_blank" rel="noreferrer" onclick="closeMobileMenu()" class="px-3 py-2.5 rounded-lg hover:bg-white/5 transition-colors flex items-center gap-2">
+                    <i data-lucide="github" class="w-4 h-4"></i> GitHub
+                </a>
+                <a href="#install" onclick="closeMobileMenu()" class="mt-1 mb-1 bg-brand-500/10 border border-brand-500/30 text-brand-400 px-4 py-2.5 rounded-lg text-center transition-colors hover:bg-brand-500/20">
+                    Get Started
+                </a>
             </div>
         </div>
     </nav>
@@ -154,9 +163,43 @@
                     <i data-lucide="star" class="w-5 h-5 fill-current"></i>
                     Star on GitHub
                 </a>
-                <a href="#terminal" class="w-full sm:w-auto flex items-center justify-center gap-2 glass-panel hover:bg-white/10 text-white font-semibold px-6 py-3 rounded-xl transition-all border border-white/10">
+                <a href="#how-it-works" class="w-full sm:w-auto flex items-center justify-center gap-2 glass-panel hover:bg-white/10 text-white font-semibold px-6 py-3 rounded-xl transition-all border border-white/10">
                     See how it works
                 </a>
+            </div>
+
+            <!-- OS picker -->
+            <div class="mb-20">
+                <h2 class="text-2xl font-bold mb-2">Install</h2>
+                <p class="text-gray-500 text-sm mb-8">Pick your OS — the command appears below.</p>
+
+                <div class="flex justify-center gap-4 mb-8">
+                    <button id="os-win" onclick="selectOs('win')" class="os-btn flex flex-col items-center justify-center gap-2 w-24 h-24 rounded-xl border border-white/10 bg-white/5 hover:bg-white/10 transition-all focus:outline-none">
+                        <svg class="w-6 h-6 text-gray-300" viewBox="0 0 24 24" fill="currentColor"><path d="M0 3.449L9.75 2.1v9.451H0m10.949-9.602L24 0v11.4H10.949M0 12.6h9.75v9.451L0 20.699M10.949 12.6H24V24l-12.9-1.801"/></svg>
+                        <span class="text-xs font-medium text-gray-300">Windows</span>
+                    </button>
+                    <button id="os-linux" onclick="selectOs('linux')" class="os-btn flex flex-col items-center justify-center gap-2 w-24 h-24 rounded-xl border border-white/10 bg-white/5 hover:bg-white/10 transition-all focus:outline-none">
+                        <svg class="w-6 h-6 text-gray-300" viewBox="0 0 24 24" fill="currentColor"><path d="M20.581 19.049c-.55-.446-.336-1.431-.907-1.917.553-3.365-.997-6.171-2.335-8.35-1.227-1.992-1.714-4.049-2.44-4.049-.726 0-.334 1.475-1.009 2.982-.706 1.578-2.076 2.12-3.508 3.36-1.413 1.22-2.538 2.815-2.465 5.334.048 1.777-.87 3.695-.566 4.123.384.631 1.903-.494 2.911-.579.74-.063 1.52.58 2.359.6.703.019 1.57-.993 2.065-.998.495.005 1.082.907 2.03.907.935 0 2.126-1.047 2.531-.964.405.084.946 1.014 1.335 1.014.39 0 1.198-1.463.999-1.463zm-8.713-1.811c-.26-.532-.358-1.53.115-2.414.73-1.344 2.113-1.677 2.942-1.163.918.567.96 1.686.655 2.548-.438 1.233-1.36 1.782-2.156 1.763-.5-.012-.985-.32-1.085-.502l-.471-.232zm2.789 1.192c.2-.232.376-.583.39-.898.243.127.625.205.864.127-.263.456-.728.757-1.254.771zm1.531-1.955c-.182.498-.503.936-.909 1.176-.141-.26-.167-.66-.027-1.051.23-.646.717-1.042 1.086-.886.244.101.088.436-.15.761zm-4.627 1.343c-.498.14-1.048-.108-1.348-.606-.338-.564-.271-1.266.151-1.697.6-.614 1.601-.55 2.031.237.299.549.187 1.308-.337 1.708l-.497.358zm7.024-8.483c-.145.552-.692.867-1.215.703-.523-.163-.818-.737-.673-1.288.145-.55.692-.867 1.215-.703.523.164.818.737.673 1.288z"/></svg>
+                        <span class="text-xs font-medium text-gray-300">Linux / WSL</span>
+                    </button>
+                </div>
+
+                <!-- Command display -->
+                <div id="os-cmd-box" class="hidden max-w-2xl mx-auto">
+                    <p id="os-cmd-label" class="text-sm font-semibold text-white mb-3">Install with one command</p>
+                    <div class="bg-dark-800 border border-white/10 rounded-xl px-5 py-4 flex items-center justify-between gap-4">
+                        <code id="os-cmd-text" class="font-mono text-sm text-gray-200 truncate"></code>
+                        <button onclick="copyOsCmd()" id="os-copy-btn" class="shrink-0 bg-white/10 hover:bg-white/20 p-2 rounded-lg transition-colors" title="Copy">
+                            <i data-lucide="copy" class="w-4 h-4 text-gray-400"></i>
+                        </button>
+                    </div>
+                    <p id="os-cmd-note" class="text-xs text-gray-600 mt-3"></p>
+                </div>
+            </div>
+
+            <div id="how-it-works" class="max-w-4xl mx-auto mb-6 text-center">
+                <h2 class="text-2xl font-bold text-white">How this works</h2>
+                <p class="text-gray-500 text-sm mt-2">Connect once. Safe commands run instantly. Anything risky goes through a plan you review and approve before it touches your server.</p>
             </div>
 
             <div id="terminal" class="max-w-4xl mx-auto bg-dark-800 rounded-2xl overflow-hidden border border-white/10 terminal-glow text-left">
@@ -440,35 +483,37 @@
         </section>
 
         <section id="install" class="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 mt-32 text-center">
-            <h2 class="text-3xl font-bold mb-6">Start in two steps.</h2>
-            <p class="text-gray-400 mb-10">Clone the repo, run the installer for your OS, then add the server to your MCP client config.</p>
+            <h2 class="text-3xl font-bold mb-6">One command to install.</h2>
+            <p class="text-gray-400 mb-10">The installer clones the repo, creates a venv, installs dependencies, and prints the exact config to paste into your MCP client.</p>
 
-            <div class="grid md:grid-cols-2 gap-6 text-left mb-10">
+            <div class="grid md:grid-cols-2 gap-6 text-left mb-6">
                 <div class="glass-panel p-6 rounded-2xl border border-white/10">
-                    <div class="text-xs text-brand-400 font-bold tracking-wider mb-4">WINDOWS</div>
-                    <div class="font-mono text-sm text-gray-300 space-y-2">
-                        <div><span class="text-gray-500">1.</span> <span class="text-brand-300">git clone</span> https://github.com/nqmn/adremote-mcp</div>
-                        <div><span class="text-gray-500">2.</span> <span class="text-brand-300">.\install.ps1</span></div>
-                        <div class="pt-2 text-gray-500 text-xs">Then add to MCP config:</div>
-                        <div class="bg-black/30 p-3 rounded-lg text-xs text-gray-300 mt-1">
-                            "command": ".venv-win\Scripts\python.exe"<br>
-                            "args": ["ssh_mcp_server.py"]
-                        </div>
+                    <div class="text-xs text-brand-400 font-bold tracking-wider mb-4 flex items-center gap-2">
+                        <i data-lucide="monitor" class="w-3.5 h-3.5"></i> WINDOWS — PowerShell
                     </div>
+                    <div class="bg-black/40 rounded-xl p-4 font-mono text-sm text-gray-200 flex items-center justify-between gap-3">
+                        <span class="truncate">irm https://raw.githubusercontent.com/nqmn/adremote-mcp/main/install.ps1 | iex</span>
+                        <button onclick="copyCmd('win')" class="shrink-0 bg-white/10 hover:bg-white/20 p-1.5 rounded-lg transition-colors" title="Copy">
+                            <i data-lucide="copy" class="w-4 h-4 text-gray-400"></i>
+                        </button>
+                    </div>
+                    <p class="text-xs text-gray-500 mt-3">Installs to <span class="font-mono text-gray-400">%USERPROFILE%\adremote-mcp</span></p>
                 </div>
                 <div class="glass-panel p-6 rounded-2xl border border-white/10">
-                    <div class="text-xs text-brand-400 font-bold tracking-wider mb-4">WSL / LINUX</div>
-                    <div class="font-mono text-sm text-gray-300 space-y-2">
-                        <div><span class="text-gray-500">1.</span> <span class="text-brand-300">git clone</span> https://github.com/nqmn/adremote-mcp</div>
-                        <div><span class="text-gray-500">2.</span> <span class="text-brand-300">./install.sh</span></div>
-                        <div class="pt-2 text-gray-500 text-xs">Then add to MCP config:</div>
-                        <div class="bg-black/30 p-3 rounded-lg text-xs text-gray-300 mt-1">
-                            "command": ".venv-linux/bin/python"<br>
-                            "args": ["ssh_mcp_server.py"]
-                        </div>
+                    <div class="text-xs text-brand-400 font-bold tracking-wider mb-4 flex items-center gap-2">
+                        <i data-lucide="terminal" class="w-3.5 h-3.5"></i> WSL / LINUX — bash
                     </div>
+                    <div class="bg-black/40 rounded-xl p-4 font-mono text-sm text-gray-200 flex items-center justify-between gap-3">
+                        <span class="truncate">curl -fsSL https://raw.githubusercontent.com/nqmn/adremote-mcp/main/install.sh | bash</span>
+                        <button onclick="copyCmd('linux')" class="shrink-0 bg-white/10 hover:bg-white/20 p-1.5 rounded-lg transition-colors" title="Copy">
+                            <i data-lucide="copy" class="w-4 h-4 text-gray-400"></i>
+                        </button>
+                    </div>
+                    <p class="text-xs text-gray-500 mt-3">Installs to <span class="font-mono text-gray-400">~/adremote-mcp</span></p>
                 </div>
             </div>
+
+            <p class="text-xs text-gray-600 mb-10">Already cloned? Run <code class="text-gray-500 font-mono">.\install.ps1</code> or <code class="text-gray-500 font-mono">./install.sh</code> from inside the repo — the installer detects it and installs in place.</p>
 
             <a href="https://github.com/nqmn/adremote-mcp/blob/main/README.md" target="_blank" rel="noreferrer" class="inline-flex items-center gap-2 bg-brand-500 hover:bg-brand-400 text-white font-semibold px-6 py-3.5 rounded-xl transition-all shadow-[0_0_15px_rgba(239,68,68,0.2)]">
                 <i data-lucide="book-open" class="w-5 h-5"></i>
@@ -496,18 +541,73 @@
 
         function toggleMobileMenu() {
             const menu = document.getElementById('mobile-menu');
-            const button = document.getElementById('mobile-menu-button');
-            const isOpen = menu.classList.contains('open');
-            menu.classList.toggle('open', !isOpen);
-            button.setAttribute('aria-expanded', String(!isOpen));
+            const iconMenu = document.getElementById('icon-menu');
+            const iconClose = document.getElementById('icon-close');
+            const isOpen = !menu.classList.contains('hidden');
+            menu.classList.toggle('hidden', isOpen);
+            iconMenu.classList.toggle('hidden', !isOpen);
+            iconClose.classList.toggle('hidden', isOpen);
         }
 
         function closeMobileMenu() {
             const menu = document.getElementById('mobile-menu');
-            const button = document.getElementById('mobile-menu-button');
-            menu.classList.remove('open');
-            button.setAttribute('aria-expanded', 'false');
+            const iconMenu = document.getElementById('icon-menu');
+            const iconClose = document.getElementById('icon-close');
+            menu.classList.add('hidden');
+            iconMenu.classList.remove('hidden');
+            iconClose.classList.add('hidden');
         }
+
+        const cmds = {
+            win: {
+                cmd: 'irm https://raw.githubusercontent.com/nqmn/adremote-mcp/main/install.ps1 | iex',
+                note: 'Installs to %USERPROFILE%\\adremote-mcp — run in PowerShell'
+            },
+            linux: {
+                cmd: 'curl -fsSL https://raw.githubusercontent.com/nqmn/adremote-mcp/main/install.sh | bash',
+                note: 'Installs to ~/adremote-mcp — run in bash or WSL terminal'
+            }
+        };
+
+        let currentOs = null;
+
+        function selectOs(os) {
+            currentOs = os;
+            document.querySelectorAll('.os-btn').forEach(btn => {
+                btn.classList.remove('border-brand-500', 'bg-brand-500/10', 'text-white');
+                btn.classList.add('border-white/10', 'bg-white/5');
+            });
+            const active = document.getElementById('os-' + os);
+            active.classList.remove('border-white/10', 'bg-white/5');
+            active.classList.add('border-brand-500', 'bg-brand-500/10');
+
+            const box = document.getElementById('os-cmd-box');
+            box.classList.remove('hidden');
+            document.getElementById('os-cmd-text').textContent = cmds[os].cmd;
+            document.getElementById('os-cmd-note').textContent = cmds[os].note;
+
+            const copyBtn = document.getElementById('os-copy-btn');
+            copyBtn.querySelector('i').setAttribute('data-lucide', 'copy');
+            lucide.createIcons();
+        }
+
+        function copyOsCmd() {
+            if (!currentOs) return;
+            navigator.clipboard.writeText(cmds[currentOs].cmd);
+            const icon = document.getElementById('os-copy-btn').querySelector('i');
+            icon.setAttribute('data-lucide', 'check');
+            lucide.createIcons();
+            setTimeout(() => {
+                icon.setAttribute('data-lucide', 'copy');
+                lucide.createIcons();
+            }, 2000);
+        }
+
+        function copyCmd(os) {
+            navigator.clipboard.writeText(cmds[os].cmd);
+        }
+
+        selectOs('linux');
 
         function toggleAccordion(button) {
             const content = button.nextElementSibling;
