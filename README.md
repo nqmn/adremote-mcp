@@ -117,10 +117,14 @@ the MCP is pointing at a venv created by WSL/Linux. Create a Windows venv with
 - Works with MCP-compatible clients on Windows and Linux
 - Connect to remote servers via SSH
 - Native SSH jump-host / bastion support
-- Execute commands remotely
+- Direct execution for simple read-only commands such as `ls`, `pwd`, and `whoami`
+- Plan-and-approve flow for non-trivial commands and remote file edits
+- Full plan details shown immediately on creation — no extra lookup needed
+- Read remote files and apply managed remote edits with verification and backups
 - Upload/download files via SFTP
 - Manage multiple connections
 - Health monitoring
+- Human-readable audit log via `ssh_read_audit_log`
 
 ## Usage Examples
 
@@ -149,6 +153,16 @@ This keeps the live connection only. No reusable credential is saved and no auto
 ssh saved-name
 ```
 After the first successful setup, just use the saved credential name to connect again.
+
+### Managed SSH key bootstrap:
+
+`ssh_setup_key_auth` no longer installs a key immediately. It now creates a
+high-risk plan because it modifies remote `authorized_keys` and stores a local
+credential. Review and approve that plan with:
+
+- `ssh_setup_key_auth`
+- `ssh_approve_plan`
+- `ssh_execute_plan`
 
 ### Connect with an encrypted (passphrase-protected) private key:
 ```
@@ -189,16 +203,85 @@ For reusable saved credentials, the jump host must use `private_key_path` rather
 
 ### Execute commands:
 ```
-List files in /home directory on my server
-Run 'top' command on the remote server
-Execute script.py and monitor its log
+Run `ls` in /home on the remote server
+Run `pwd` on the remote server
+Run `whoami` on the remote server
 ```
+
+Simple read-only commands from the allowlist execute directly. Commands outside
+that allowlist are blocked from direct execution and returned as plans that must
+be reviewed and approved before they run.
+
+Plans are stored locally so they survive MCP server restarts. Each plan expires
+after 24 hours; expired plans must be recreated.
+
+Use `ssh_get_plan` to retrieve the full stored plan body, including payload and
+approval metadata, when the chat output no longer shows it.
+
+Each stored plan also keeps a compact approval summary with:
+- tool
+- target
+- action
+- summary
+- plan id
+
+Clients can use that summary directly for permission prompts without fetching
+the full plan body every time.
+
+### Managed command plans:
+Use these tools for commands outside the direct allowlist:
+
+- `ssh_plan_command`
+- `ssh_approve_plan`
+- `ssh_execute_plan`
+- `ssh_list_plans`
+- `ssh_get_plan`
+- `ssh_reject_plan`
+
+Typical flow:
+1. Create a command plan with `ssh_plan_command`
+2. Review the returned risk and rollback details
+3. Approve it with `ssh_approve_plan`
+4. Execute it with `ssh_execute_plan`
+
+### Remote file reads and edits:
+
+Read a remote file directly:
+```
+Read /etc/nginx/nginx.conf on the server
+```
+
+For remote edits, use the managed edit lane:
+
+- `ssh_read_file`
+- `ssh_plan_edit`
+- `ssh_approve_plan`
+- `ssh_execute_plan`
+
+`ssh_plan_edit` stores the current file hash, requires approval, and
+`ssh_execute_plan` writes the new content only after approval. Before writing,
+the server creates a timestamped `.ssh-mcp.bak.<timestamp>` backup and verifies
+the post-write SHA256 hash.
 
 ### File transfers:
 ```
 Upload local file.txt to /home/user/ on the server
 Download /var/log/app.log from the server
 ```
+
+`ssh_upload_file` now creates an approval-backed plan before writing to the
+remote host. After approval, `ssh_execute_plan` uploads the file and verifies
+the remote SHA256 hash. `ssh_download_file` remains a direct read path to local
+allowed roots.
+
+### Audit log:
+```
+Show me the audit log
+Show last 10 audit events
+Show only approved plans in the audit log
+```
+
+Use `ssh_read_audit_log` to view a human-readable history of all plan lifecycle events. Each entry shows the timestamp, event type, plan ID, kind, connection, risk level, and summary. Use `limit` to cap the number of entries and `event_filter` to narrow by event type (`plan_created`, `plan_approved`, `plan_rejected`, `plan_executed`, `plan_expired`).
 
 ### Connection health and inventory:
 ```
@@ -213,6 +296,24 @@ Show me all active SSH connections
 - mcp
 
 ## Latest Update
+
+Version `1.2.0` improves plan visibility and adds a readable audit log tool:
+
+- All plan-creating tools (`ssh_execute`, `ssh_plan_command`, `ssh_plan_edit`, `ssh_upload_file`, `ssh_setup_key_auth`) now return full plan details including risk, rollback plan, and payload immediately on creation — no need to call `ssh_get_plan` separately
+- New `ssh_read_audit_log` tool reads `.ssh_mcp_audit.jsonl` and formats it into a human-readable event history with timestamps, event labels, and extra context per entry
+- `ssh_read_audit_log` supports `limit` (number of recent entries) and `event_filter` (narrow by event type)
+
+Version `1.1.0` adds orchestration for non-trivial remote actions:
+
+- `ssh_execute` now runs only a conservative allowlist of simple read-only commands directly
+- Commands outside the allowlist are converted into plans that require approval before execution
+- New tools support managed remote reads and edits: `ssh_read_file`, `ssh_plan_edit`, `ssh_approve_plan`, `ssh_execute_plan`, `ssh_list_plans`, and `ssh_reject_plan`
+- `ssh_setup_key_auth` now creates an approval-backed plan before modifying remote `authorized_keys` or saving a credential
+- `ssh_upload_file` now creates an approval-backed plan before writing a file to the remote host
+- Approval-backed plans are now persisted locally and expire after 24 hours
+- Audit events are appended to `.ssh_mcp_audit.jsonl` in the current workspace folder
+- Each plan now stores a compact approval summary for low-token permission prompts
+- Managed remote edits create a timestamped backup and verify the resulting file hash after writing
 
 Version `1.0.3` persists the private key passphrase in saved credentials:
 
@@ -238,4 +339,5 @@ Version `1.0.1` adds safer and more practical day-to-day SSH workflows:
 
 ## Support
 
-Contact me to collaborate.
+- GitHub: https://github.com/nqmn/adremote-mcp
+- Email: mohdadil@live.com

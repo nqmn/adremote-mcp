@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import os
+import shlex
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,6 +38,59 @@ CREDENTIAL_STORE_FILE = ".ssh_mcp_credentials.json"
 CREDENTIAL_STORE_VERSION = 1
 KEY_STORE_DIR = ".ssh_mcp_keys"
 HOST_KEY_STORE_FILE = ".ssh_mcp_known_hosts"
+PLAN_STORE_FILE = ".ssh_mcp_plans.json"
+AUDIT_LOG_FILE = ".ssh_mcp_audit.jsonl"
+PLAN_STORE_VERSION = 1
+DEFAULT_PLAN_TTL_SECONDS = 24 * 60 * 60
+PLAN_STATUS_DRAFT = "draft"
+PLAN_STATUS_APPROVED = "approved"
+PLAN_STATUS_EXECUTED = "executed"
+PLAN_STATUS_REJECTED = "rejected"
+PLAN_KIND_COMMAND = "command"
+PLAN_KIND_FILE_EDIT = "file_edit"
+PLAN_KIND_UPLOAD = "upload"
+PLAN_KIND_KEY_AUTH = "key_auth"
+SAFE_DIRECT_COMMANDS = {
+    "date",
+    "hostname",
+    "id",
+    "ls",
+    "pwd",
+    "uname",
+    "uptime",
+    "whoami",
+}
+HIGH_RISK_COMMAND_PREFIXES = {
+    "apt",
+    "apt-get",
+    "chmod",
+    "chown",
+    "cp",
+    "curl",
+    "dnf",
+    "docker",
+    "git",
+    "install",
+    "kubectl",
+    "mkdir",
+    "mv",
+    "npm",
+    "pip",
+    "python",
+    "python3",
+    "rm",
+    "rmdir",
+    "sed",
+    "service",
+    "systemctl",
+    "tee",
+    "touch",
+    "vi",
+    "vim",
+    "wget",
+    "yum",
+}
+SHELL_META_TOKENS = ("&&", "||", "|", ";", ">", "<", "$(", "`", "\n", "\r")
 
 
 def _set_posix_permissions(path: Path, mode: int) -> None:
@@ -82,6 +136,28 @@ class SSHConnection:
 
     def __post_init__(self):
         self.last_used = time.time()
+
+
+@dataclass
+class ExecutionPlan:
+    """Represents a managed command or remote file edit."""
+    plan_id: str
+    kind: str
+    connection_name: str
+    status: str
+    approval_required: bool
+    risk: str
+    operational_risk: str
+    approval_summary: Dict[str, str]
+    summary: str
+    rollback_plan: str
+    created_at: float
+    expires_at: float
+    payload: Dict[str, Any]
+    verification: str | None = None
+    approved_at: float | None = None
+    executed_at: float | None = None
+    approval_note: str | None = None
 
 
 class CredentialStore:
@@ -160,14 +236,104 @@ class CredentialStore:
         return entries
 
 
+class PlanStore:
+    """Persist execution plans locally so approvals survive restarts."""
+
+    def __init__(self, store_path: Path):
+        self.store_path = store_path
+        self.store_path.parent.mkdir(parents=True, exist_ok=True)
+        _ensure_file(self.store_path, mode=0o600)
+
+    def load(self) -> Dict[str, ExecutionPlan]:
+        try:
+            raw_text = self.store_path.read_text(encoding="utf-8").strip()
+            if not raw_text:
+                return {}
+            data = json.loads(raw_text)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {}
+
+        if data.get("version") != PLAN_STORE_VERSION:
+            return {}
+
+        plans: Dict[str, ExecutionPlan] = {}
+        for item in data.get("plans", []):
+            try:
+                item.setdefault(
+                    "approval_summary",
+                    {
+                        "tool": "ssh_execute_plan",
+                        "target": item.get("connection_name", ""),
+                        "action": item.get("kind", ""),
+                        "summary": item.get("summary", ""),
+                        "plan_id": item.get("plan_id", ""),
+                    },
+                )
+                plan = ExecutionPlan(**item)
+            except TypeError:
+                continue
+            plans[plan.plan_id] = plan
+        return plans
+
+    def save(self, plans: Dict[str, ExecutionPlan]) -> None:
+        payload = {
+            "version": PLAN_STORE_VERSION,
+            "plans": [
+                {
+                    "plan_id": plan.plan_id,
+                    "kind": plan.kind,
+                    "connection_name": plan.connection_name,
+                    "status": plan.status,
+                    "approval_required": plan.approval_required,
+                    "risk": plan.risk,
+                    "operational_risk": plan.operational_risk,
+                    "approval_summary": plan.approval_summary,
+                    "summary": plan.summary,
+                    "rollback_plan": plan.rollback_plan,
+                    "created_at": plan.created_at,
+                    "expires_at": plan.expires_at,
+                    "payload": plan.payload,
+                    "verification": plan.verification,
+                    "approved_at": plan.approved_at,
+                    "executed_at": plan.executed_at,
+                    "approval_note": plan.approval_note,
+                }
+                for plan in sorted(plans.values(), key=lambda item: item.created_at)
+            ],
+        }
+        _write_secure_text(
+            self.store_path,
+            json.dumps(payload, indent=2, sort_keys=True),
+            mode=0o600,
+        )
+
+
+class AuditLog:
+    """Append-only audit log for plan lifecycle events."""
+
+    def __init__(self, log_path: Path):
+        self.log_path = log_path
+        _ensure_file(self.log_path, mode=0o600)
+
+    def append(self, event: Dict[str, Any]) -> None:
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.log_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event, sort_keys=True) + "\n")
+        _set_posix_permissions(self.log_path, 0o600)
+
+
 class SSHMCPServer:
     """MCP Server for SSH operations on remote Ubuntu servers."""
 
     def __init__(self):
         self.server = Server("ssh-mcp-server")
         self.connections: Dict[str, SSHConnection] = {}
+        self.workspace_dir = Path.cwd().resolve(strict=False)
         self.allowed_local_roots = self._load_allowed_local_roots()
         self.credential_store = CredentialStore(Path.home() / CREDENTIAL_STORE_FILE)
+        self.plan_store = PlanStore(Path.home() / PLAN_STORE_FILE)
+        self.audit_log = AuditLog(self.workspace_dir / AUDIT_LOG_FILE)
+        self.plans: Dict[str, ExecutionPlan] = self.plan_store.load()
         self.host_key_store_path = Path.home() / HOST_KEY_STORE_FILE
         _ensure_file(self.host_key_store_path, mode=0o600)
         self.key_store_dir = Path.home() / KEY_STORE_DIR
@@ -215,6 +381,227 @@ class SSHMCPServer:
     async def _run_blocking(self, func, *args, **kwargs):
         """Run Paramiko's blocking calls off the event loop."""
         return await asyncio.to_thread(func, *args, **kwargs)
+
+    def _ensure_connection(self, connection_name: str) -> SSHConnection:
+        if connection_name not in self.connections:
+            raise KeyError(f"Connection '{connection_name}' not found")
+
+        connection = self.connections[connection_name]
+        if not connection.connected:
+            raise RuntimeError(f"Connection '{connection_name}' is not active")
+
+        return connection
+
+    def _new_plan_id(self) -> str:
+        digest = hashlib.sha256(f"{time.time_ns()}-{len(self.plans)}".encode("utf-8")).hexdigest()
+        return f"plan-{digest[:12]}"
+
+    def _save_plans(self) -> None:
+        self.plan_store.save(self.plans)
+
+    def _audit_event(
+        self,
+        event_type: str,
+        plan: ExecutionPlan,
+        *,
+        extra: Dict[str, Any] | None = None,
+    ) -> None:
+        event = {
+            "ts": time.time(),
+            "event": event_type,
+            "plan_id": plan.plan_id,
+            "kind": plan.kind,
+            "connection_name": plan.connection_name,
+            "status": plan.status,
+            "risk": plan.risk,
+            "summary": plan.summary,
+        }
+        if extra:
+            event["extra"] = extra
+        self.audit_log.append(event)
+
+    def _is_plan_expired(self, plan: ExecutionPlan) -> bool:
+        return time.time() > plan.expires_at
+
+    def _expire_plan_if_needed(self, plan: ExecutionPlan) -> bool:
+        if self._is_plan_expired(plan) and plan.status not in (
+            PLAN_STATUS_EXECUTED,
+            PLAN_STATUS_REJECTED,
+        ):
+            plan.status = PLAN_STATUS_REJECTED
+            if not plan.approval_note:
+                plan.approval_note = "Expired before approval/execution."
+            self._save_plans()
+            self._audit_event("plan_expired", plan)
+            return True
+        return False
+
+    def _format_plan(self, plan: ExecutionPlan) -> str:
+        lines = [
+            f"Plan ID: {plan.plan_id}",
+            f"Kind: {plan.kind}",
+            f"Connection: {plan.connection_name}",
+            f"Status: {plan.status}",
+            f"Approval required: {'yes' if plan.approval_required else 'no'}",
+            f"Risk: {plan.risk}",
+            f"Operational risk: {plan.operational_risk}",
+            f"Summary: {plan.summary}",
+            f"Rollback plan: {plan.rollback_plan}",
+            f"Expires at: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(plan.expires_at))}",
+        ]
+        if plan.approval_note:
+            lines.append(f"Approval note: {plan.approval_note}")
+        if plan.verification:
+            lines.append(f"Verification: {plan.verification}")
+        if plan.approval_summary:
+            lines.append("Approval summary:")
+            for key in ("tool", "target", "action", "summary", "plan_id"):
+                value = plan.approval_summary.get(key)
+                if value:
+                    lines.append(f"- {key}: {value}")
+        return "\n".join(lines)
+
+    def _store_plan(
+        self,
+        *,
+        kind: str,
+        connection_name: str,
+        approval_required: bool,
+        risk: str,
+        operational_risk: str,
+        approval_summary: Dict[str, str],
+        summary: str,
+        rollback_plan: str,
+        payload: Dict[str, Any],
+    ) -> ExecutionPlan:
+        plan = ExecutionPlan(
+            plan_id=self._new_plan_id(),
+            kind=kind,
+            connection_name=connection_name,
+            status=PLAN_STATUS_DRAFT,
+            approval_required=approval_required,
+            risk=risk,
+            operational_risk=operational_risk,
+            approval_summary=approval_summary,
+            summary=summary,
+            rollback_plan=rollback_plan,
+            created_at=time.time(),
+            expires_at=time.time() + DEFAULT_PLAN_TTL_SECONDS,
+            payload=payload,
+        )
+        if not plan.approval_summary.get("plan_id"):
+            plan.approval_summary["plan_id"] = plan.plan_id
+        self.plans[plan.plan_id] = plan
+        self._save_plans()
+        self._audit_event("plan_created", plan)
+        return plan
+
+    def _format_plan_summary(self, plan: ExecutionPlan) -> str:
+        return (
+            f"Plan created: {plan.plan_id}\n"
+            f"- tool: {plan.approval_summary.get('tool', 'ssh_execute_plan')}\n"
+            f"- target: {plan.approval_summary.get('target', plan.connection_name)}\n"
+            f"- action: {plan.approval_summary.get('action', plan.kind)}\n"
+            f"- summary: {plan.approval_summary.get('summary', plan.summary)}\n"
+            f"- plan id: {plan.plan_id}\n"
+            f"Expires at: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(plan.expires_at))}\n"
+            f"Next step: call ssh_get_plan for details, then ssh_approve_plan and ssh_execute_plan."
+        )
+
+    def _command_contains_shell_meta(self, command: str) -> bool:
+        return any(token in command for token in SHELL_META_TOKENS)
+
+    def _classify_command(self, command: str) -> tuple[str, bool, str, str]:
+        try:
+            tokens = shlex.split(command, posix=True)
+        except ValueError:
+            return (
+                "high",
+                True,
+                "systemic / partial",
+                "Command parsing failed; require manual review before execution.",
+            )
+
+        if not tokens:
+            return (
+                "medium",
+                True,
+                "local / trivial",
+                "Empty command is not executable; provide a concrete command.",
+            )
+
+        if self._command_contains_shell_meta(command):
+            return (
+                "high",
+                True,
+                "broad / partial",
+                "Command uses shell composition or redirection and must be reviewed before execution.",
+            )
+
+        executable = tokens[0]
+        if executable in SAFE_DIRECT_COMMANDS:
+            return (
+                "low",
+                False,
+                "local / trivial",
+                "Read-only command matches the direct execution allowlist.",
+            )
+
+        if executable in HIGH_RISK_COMMAND_PREFIXES:
+            return (
+                "high",
+                True,
+                "contained / partial",
+                f"Command starts with '{executable}', which can mutate remote state.",
+            )
+
+        return (
+            "medium",
+            True,
+            "contained / partial",
+            "Command is not on the direct execution allowlist and requires a reviewed plan.",
+        )
+
+    async def _read_remote_file_bytes(
+        self, connection: SSHConnection, remote_path: str
+    ) -> bytes:
+        def read_file() -> bytes:
+            sftp = connection.client.open_sftp()
+            try:
+                with sftp.file(remote_path, "rb") as remote_file:
+                    return remote_file.read()
+            finally:
+                sftp.close()
+
+        return await self._run_blocking(read_file)
+
+    async def _write_remote_file_bytes(
+        self,
+        connection: SSHConnection,
+        remote_path: str,
+        content: bytes,
+        backup_path: str | None = None,
+    ) -> None:
+        def write_file() -> None:
+            sftp = connection.client.open_sftp()
+            try:
+                if backup_path is not None:
+                    with sftp.file(remote_path, "rb") as source_file:
+                        original = source_file.read()
+                    with sftp.file(backup_path, "wb") as backup_file:
+                        backup_file.write(original)
+                with sftp.file(remote_path, "wb") as target_file:
+                    target_file.write(content)
+            finally:
+                sftp.close()
+
+        await self._run_blocking(write_file)
+
+    async def _remote_file_sha256(
+        self, connection: SSHConnection, remote_path: str
+    ) -> str:
+        content = await self._read_remote_file_bytes(connection, remote_path)
+        return hashlib.sha256(content).hexdigest()
 
     async def _exec_command(
         self, client: paramiko.SSHClient, command: str, timeout: int
@@ -768,6 +1155,149 @@ class SSHMCPServer:
                     }
                 ),
                 Tool(
+                    name="ssh_read_file",
+                    description="Read a remote file over SFTP without modifying it",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "connection_name": {
+                                "type": "string",
+                                "description": "Name of the SSH connection to use"
+                            },
+                            "remote_path": {
+                                "type": "string",
+                                "description": "Remote file path to read"
+                            },
+                            "encoding": {
+                                "type": "string",
+                                "description": "Text encoding to use when decoding bytes",
+                                "default": "utf-8"
+                            }
+                        },
+                        "required": ["connection_name", "remote_path"]
+                    }
+                ),
+                Tool(
+                    name="ssh_plan_command",
+                    description="Create a reviewed execution plan for a non-trivial remote command",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "connection_name": {
+                                "type": "string",
+                                "description": "Name of the SSH connection to use"
+                            },
+                            "command": {
+                                "type": "string",
+                                "description": "Remote command to review and plan"
+                            },
+                            "reason": {
+                                "type": "string",
+                                "description": "Optional human explanation for why the command is needed"
+                            }
+                        },
+                        "required": ["connection_name", "command"]
+                    }
+                ),
+                Tool(
+                    name="ssh_plan_edit",
+                    description="Create a managed remote file edit plan that requires approval before writing",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "connection_name": {
+                                "type": "string",
+                                "description": "Name of the SSH connection to use"
+                            },
+                            "remote_path": {
+                                "type": "string",
+                                "description": "Remote file path to modify"
+                            },
+                            "new_content": {
+                                "type": "string",
+                                "description": "Full replacement text for the remote file"
+                            },
+                            "reason": {
+                                "type": "string",
+                                "description": "Why the file edit is needed"
+                            }
+                        },
+                        "required": ["connection_name", "remote_path", "new_content"]
+                    }
+                ),
+                Tool(
+                    name="ssh_list_plans",
+                    description="List in-memory command and file edit plans",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {}
+                    }
+                ),
+                Tool(
+                    name="ssh_get_plan",
+                    description="Show full detail for one stored plan",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "plan_id": {
+                                "type": "string",
+                                "description": "Stored plan identifier"
+                            }
+                        },
+                        "required": ["plan_id"]
+                    }
+                ),
+                Tool(
+                    name="ssh_approve_plan",
+                    description="Approve a stored plan so it can be executed",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "plan_id": {
+                                "type": "string",
+                                "description": "Plan identifier returned by ssh_plan_command or ssh_plan_edit"
+                            },
+                            "approval_note": {
+                                "type": "string",
+                                "description": "Optional note captured with the approval"
+                            }
+                        },
+                        "required": ["plan_id"]
+                    }
+                ),
+                Tool(
+                    name="ssh_reject_plan",
+                    description="Reject a stored plan so it cannot be executed",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "plan_id": {
+                                "type": "string",
+                                "description": "Plan identifier returned by ssh_plan_command or ssh_plan_edit"
+                            },
+                            "reason": {
+                                "type": "string",
+                                "description": "Optional rejection note"
+                            }
+                        },
+                        "required": ["plan_id"]
+                    }
+                ),
+                Tool(
+                    name="ssh_execute_plan",
+                    description="Execute an approved command or remote file edit plan",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "plan_id": {
+                                "type": "string",
+                                "description": "Approved plan identifier to execute"
+                            }
+                        },
+                        "required": ["plan_id"]
+                    }
+                ),
+                Tool(
                     name="ssh_upload_file",
                     description="Upload a local file from an allowed local root to the remote server via SFTP",
                     inputSchema={
@@ -946,6 +1476,24 @@ class SSHMCPServer:
                             }
                         }
                     }
+                ),
+                Tool(
+                    name="ssh_read_audit_log",
+                    description="Read the audit log of all plan lifecycle events in a human-readable format",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "limit": {
+                                "type": "integer",
+                                "description": "Maximum number of recent entries to show (default: 50)",
+                                "default": 50
+                            },
+                            "event_filter": {
+                                "type": "string",
+                                "description": "Filter by event type: plan_created, plan_approved, plan_rejected, plan_executed, plan_expired"
+                            }
+                        }
+                    }
                 )
             ]
 
@@ -961,6 +1509,22 @@ class SSHMCPServer:
                     return await self._ssh_connect_saved(arguments)
                 elif name == "ssh_execute":
                     return await self._ssh_execute(arguments)
+                elif name == "ssh_read_file":
+                    return await self._ssh_read_file(arguments)
+                elif name == "ssh_plan_command":
+                    return await self._ssh_plan_command(arguments)
+                elif name == "ssh_plan_edit":
+                    return await self._ssh_plan_edit(arguments)
+                elif name == "ssh_list_plans":
+                    return await self._ssh_list_plans(arguments)
+                elif name == "ssh_get_plan":
+                    return await self._ssh_get_plan(arguments)
+                elif name == "ssh_approve_plan":
+                    return await self._ssh_approve_plan(arguments)
+                elif name == "ssh_reject_plan":
+                    return await self._ssh_reject_plan(arguments)
+                elif name == "ssh_execute_plan":
+                    return await self._ssh_execute_plan(arguments)
                 elif name == "ssh_setup_key_auth":
                     return await self._ssh_setup_key_auth(arguments)
                 elif name == "ssh_upload_file":
@@ -979,6 +1543,8 @@ class SSHMCPServer:
                     return await self._ssh_list_connections(arguments)
                 elif name == "ssh_health_check":
                     return await self._ssh_health_check(arguments)
+                elif name == "ssh_read_audit_log":
+                    return await self._ssh_read_audit_log(arguments)
                 else:
                     return [TextContent(type="text", text=f"Unknown tool: {name}")]
             except Exception as e:
@@ -1183,12 +1749,10 @@ class SSHMCPServer:
     async def _ssh_setup_key_auth(self, args: Dict[str, Any]) -> List[TextContent]:
         """Bootstrap SSH key authentication for an active connection."""
         connection_name = args["connection_name"]
-        if connection_name not in self.connections:
-            return [TextContent(type="text", text=f"Connection '{connection_name}' not found")]
-
-        connection = self.connections[connection_name]
-        if not connection.connected:
-            return [TextContent(type="text", text=f"Connection '{connection_name}' is not active")]
+        try:
+            connection = self._ensure_connection(connection_name)
+        except (KeyError, RuntimeError) as e:
+            return [TextContent(type="text", text=str(e))]
 
         credential_name = args.get("credential_name", connection_name)
         key_name = args.get("key_name", credential_name)
@@ -1209,30 +1773,38 @@ class SSHMCPServer:
                 ),
             )]
 
-        try:
-            await self._bootstrap_key_auth(
-                client=connection.client,
-                hostname=connection.hostname,
-                username=connection.username,
-                port=connection.port,
-                credential_name=credential_name,
-                key_name=key_name,
-                key_comment=key_comment,
-                known_hosts_path=connection.known_hosts_path,
-                overwrite_saved_credential=overwrite_saved_credential,
-                jump_host=connection.jump_host,
-            )
-
-            return [TextContent(
-                type="text",
-                text=(
-                    f"Installed SSH public key on {connection.hostname} and saved "
-                    f"key-based credential '{credential_name}'. Future logins can use "
-                    f"ssh_connect_saved name={credential_name}."
-                ),
-            )]
-        except Exception as e:
-            return [TextContent(type="text", text=f"Failed to set up key auth: {str(e)}")]
+        plan = self._store_plan(
+            kind=PLAN_KIND_KEY_AUTH,
+            connection_name=connection_name,
+            approval_required=True,
+            risk="high",
+            operational_risk="contained / partial",
+            approval_summary={
+                "tool": "ssh_execute_plan",
+                "target": connection_name,
+                "action": "Install SSH public key",
+                "summary": f"Save credential {credential_name} on {connection.hostname}",
+                "plan_id": "",
+            },
+            summary=(
+                f"Install SSH public key on {connection.hostname} and save credential "
+                f"'{credential_name}'"
+            ),
+            rollback_plan=(
+                "Remove the added public key from remote authorized_keys and delete the "
+                "saved local credential if rollback is required."
+            ),
+            payload={
+                "credential_name": credential_name,
+                "key_name": key_name,
+                "key_comment": key_comment,
+                "overwrite_saved_credential": overwrite_saved_credential,
+            },
+        )
+        message = self._format_plan(plan)
+        if plan.payload:
+            message += "\nPayload:\n" + json.dumps(plan.payload, indent=2, sort_keys=True)
+        return [TextContent(type="text", text=message)]
 
     async def _ssh_execute(self, args: Dict[str, Any]) -> List[TextContent]:
         """Execute command on remote server."""
@@ -1240,12 +1812,40 @@ class SSHMCPServer:
         command = args["command"]
         timeout = args.get("timeout", 30)
 
-        if connection_name not in self.connections:
-            return [TextContent(type="text", text=f"Connection '{connection_name}' not found")]
+        try:
+            connection = self._ensure_connection(connection_name)
+        except (KeyError, RuntimeError) as e:
+            return [TextContent(type="text", text=str(e))]
 
-        connection = self.connections[connection_name]
-        if not connection.connected:
-            return [TextContent(type="text", text=f"Connection '{connection_name}' is not active")]
+        risk, approval_required, operational_risk, classification_reason = self._classify_command(
+            command
+        )
+        if approval_required:
+            plan = self._store_plan(
+                kind=PLAN_KIND_COMMAND,
+                connection_name=connection_name,
+                approval_required=True,
+                risk=risk,
+                operational_risk=operational_risk,
+                approval_summary={
+                    "tool": "ssh_execute_plan",
+                    "target": connection_name,
+                    "action": "Execute remote command",
+                    "summary": command,
+                    "plan_id": "",
+                },
+                summary=f"Review command before execution: {command}",
+                rollback_plan="Not executed yet. Approve only after reviewing remote impact.",
+                payload={
+                    "command": command,
+                    "timeout": timeout,
+                    "classification_reason": classification_reason,
+                },
+            )
+            message = self._format_plan(plan)
+            if plan.payload:
+                message += "\nPayload:\n" + json.dumps(plan.payload, indent=2, sort_keys=True)
+            return [TextContent(type="text", text=message)]
 
         try:
             # Update last used timestamp
@@ -1272,47 +1872,413 @@ class SSHMCPServer:
         except Exception as e:
             return [TextContent(type="text", text=f"Failed to execute command: {str(e)}")]
 
+    async def _ssh_read_file(self, args: Dict[str, Any]) -> List[TextContent]:
+        """Read a remote file without modifying it."""
+        connection_name = args["connection_name"]
+        remote_path = args["remote_path"]
+        encoding = args.get("encoding", "utf-8")
+
+        try:
+            connection = self._ensure_connection(connection_name)
+        except (KeyError, RuntimeError) as e:
+            return [TextContent(type="text", text=str(e))]
+
+        try:
+            connection.last_used = time.time()
+            content = await self._read_remote_file_bytes(connection, remote_path)
+            decoded = content.decode(encoding, errors="replace")
+            sha256_digest = hashlib.sha256(content).hexdigest()
+            result = (
+                f"Remote path: {remote_path}\n"
+                f"Bytes: {len(content)}\n"
+                f"SHA256: {sha256_digest}\n\n"
+                f"{decoded}"
+            )
+            return [TextContent(type="text", text=result)]
+        except FileNotFoundError:
+            return [TextContent(type="text", text=f"Remote file not found: {remote_path}")]
+        except OSError as e:
+            return [TextContent(type="text", text=f"Failed to read remote file: {str(e)}")]
+        except Exception as e:
+            return [TextContent(type="text", text=f"Failed to read remote file: {str(e)}")]
+
+    async def _ssh_plan_command(self, args: Dict[str, Any]) -> List[TextContent]:
+        """Create a managed plan for a command that should not run directly."""
+        connection_name = args["connection_name"]
+        command = args["command"]
+        reason = args.get("reason")
+
+        try:
+            self._ensure_connection(connection_name)
+        except (KeyError, RuntimeError) as e:
+            return [TextContent(type="text", text=str(e))]
+
+        risk, approval_required, operational_risk, classification_reason = self._classify_command(
+            command
+        )
+        plan = self._store_plan(
+            kind=PLAN_KIND_COMMAND,
+            connection_name=connection_name,
+            approval_required=approval_required,
+            risk=risk,
+            operational_risk=operational_risk,
+            approval_summary={
+                "tool": "ssh_execute_plan",
+                "target": connection_name,
+                "action": "Execute remote command",
+                "summary": command,
+                "plan_id": "",
+            },
+            summary=f"Execute remote command: {command}",
+            rollback_plan="Command execution is not inherently reversible; validate command intent before approval.",
+            payload={
+                "command": command,
+                "timeout": args.get("timeout", 30),
+                "reason": reason,
+                "classification_reason": classification_reason,
+            },
+        )
+        message = self._format_plan(plan)
+        if plan.payload:
+            message += "\nPayload:\n" + json.dumps(plan.payload, indent=2, sort_keys=True)
+        return [TextContent(type="text", text=message)]
+
+    async def _ssh_plan_edit(self, args: Dict[str, Any]) -> List[TextContent]:
+        """Create a managed plan for editing a remote file."""
+        connection_name = args["connection_name"]
+        remote_path = args["remote_path"]
+        new_content = args["new_content"]
+        reason = args.get("reason")
+
+        try:
+            connection = self._ensure_connection(connection_name)
+        except (KeyError, RuntimeError) as e:
+            return [TextContent(type="text", text=str(e))]
+
+        try:
+            original_bytes = await self._read_remote_file_bytes(connection, remote_path)
+        except FileNotFoundError:
+            return [TextContent(type="text", text=f"Remote file not found: {remote_path}")]
+        except Exception as e:
+            return [TextContent(type="text", text=f"Failed to inspect remote file: {str(e)}")]
+
+        new_bytes = new_content.encode("utf-8")
+        original_hash = hashlib.sha256(original_bytes).hexdigest()
+        new_hash = hashlib.sha256(new_bytes).hexdigest()
+        plan = self._store_plan(
+            kind=PLAN_KIND_FILE_EDIT,
+            connection_name=connection_name,
+            approval_required=True,
+            risk="high",
+            operational_risk="contained / partial",
+            approval_summary={
+                "tool": "ssh_execute_plan",
+                "target": connection_name,
+                "action": "Replace remote file contents",
+                "summary": remote_path,
+                "plan_id": "",
+            },
+            summary=f"Replace remote file contents at {remote_path}",
+            rollback_plan=(
+                "Server creates a timestamped .bak file before writing. "
+                "Restore that backup if rollback is needed."
+            ),
+            payload={
+                "remote_path": remote_path,
+                "new_content": new_content,
+                "reason": reason,
+                "original_sha256": original_hash,
+                "new_sha256": new_hash,
+                "original_bytes": len(original_bytes),
+                "new_bytes": len(new_bytes),
+            },
+        )
+        message = self._format_plan(plan)
+        if plan.payload:
+            message += "\nPayload:\n" + json.dumps(plan.payload, indent=2, sort_keys=True)
+        return [TextContent(type="text", text=message)]
+
+    async def _ssh_list_plans(self, args: Dict[str, Any]) -> List[TextContent]:
+        """List all in-memory plans."""
+        if not self.plans:
+            return [TextContent(type="text", text="No stored plans")]
+
+        lines = ["Stored plans:"]
+        for plan in sorted(self.plans.values(), key=lambda item: item.created_at):
+            self._expire_plan_if_needed(plan)
+            lines.append(
+                f"- {plan.plan_id}: {plan.kind} on {plan.connection_name} "
+                f"[{plan.status}] risk={plan.risk} approval_required={'yes' if plan.approval_required else 'no'} "
+                f"expires={time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(plan.expires_at))}"
+            )
+        return [TextContent(type="text", text="\n".join(lines))]
+
+    async def _ssh_get_plan(self, args: Dict[str, Any]) -> List[TextContent]:
+        """Return full detail for a stored plan."""
+        plan_id = args["plan_id"]
+
+        if plan_id not in self.plans:
+            return [TextContent(type="text", text=f"Plan '{plan_id}' not found")]
+
+        plan = self.plans[plan_id]
+        self._expire_plan_if_needed(plan)
+        message = self._format_plan(plan)
+        if plan.payload:
+            message += "\nPayload:\n" + json.dumps(plan.payload, indent=2, sort_keys=True)
+        return [TextContent(type="text", text=message)]
+
+    async def _ssh_approve_plan(self, args: Dict[str, Any]) -> List[TextContent]:
+        """Approve a stored plan."""
+        plan_id = args["plan_id"]
+        approval_note = args.get("approval_note")
+
+        if plan_id not in self.plans:
+            return [TextContent(type="text", text=f"Plan '{plan_id}' not found")]
+
+        plan = self.plans[plan_id]
+        if self._expire_plan_if_needed(plan):
+            return [TextContent(type="text", text=f"Plan '{plan_id}' has expired and must be recreated")]
+        if plan.status == PLAN_STATUS_REJECTED:
+            return [TextContent(type="text", text=f"Plan '{plan_id}' has been rejected and cannot be approved")]
+        if plan.status == PLAN_STATUS_EXECUTED:
+            return [TextContent(type="text", text=f"Plan '{plan_id}' has already been executed")]
+
+        plan.status = PLAN_STATUS_APPROVED
+        plan.approved_at = time.time()
+        plan.approval_note = approval_note
+        self._save_plans()
+        self._audit_event("plan_approved", plan, extra={"approval_note": approval_note})
+        return [TextContent(type="text", text=f"Approved plan '{plan_id}'.\n{self._format_plan(plan)}")]
+
+    async def _ssh_reject_plan(self, args: Dict[str, Any]) -> List[TextContent]:
+        """Reject a stored plan."""
+        plan_id = args["plan_id"]
+        reason = args.get("reason")
+
+        if plan_id not in self.plans:
+            return [TextContent(type="text", text=f"Plan '{plan_id}' not found")]
+
+        plan = self.plans[plan_id]
+        if plan.status == PLAN_STATUS_EXECUTED:
+            return [TextContent(type="text", text=f"Plan '{plan_id}' has already been executed")]
+
+        plan.status = PLAN_STATUS_REJECTED
+        plan.approval_note = reason
+        self._save_plans()
+        self._audit_event("plan_rejected", plan, extra={"reason": reason})
+        return [TextContent(type="text", text=f"Rejected plan '{plan_id}'.\n{self._format_plan(plan)}")]
+
+    async def _ssh_execute_plan(self, args: Dict[str, Any]) -> List[TextContent]:
+        """Execute an approved command or remote file edit plan."""
+        plan_id = args["plan_id"]
+
+        if plan_id not in self.plans:
+            return [TextContent(type="text", text=f"Plan '{plan_id}' not found")]
+
+        plan = self.plans[plan_id]
+        if self._expire_plan_if_needed(plan):
+            return [TextContent(type="text", text=f"Plan '{plan_id}' has expired and must be recreated")]
+        if plan.status != PLAN_STATUS_APPROVED:
+            return [TextContent(
+                type="text",
+                text=f"Plan '{plan_id}' is not approved. Current status: {plan.status}",
+            )]
+
+        try:
+            connection = self._ensure_connection(plan.connection_name)
+        except (KeyError, RuntimeError) as e:
+            return [TextContent(type="text", text=str(e))]
+
+        connection.last_used = time.time()
+
+        try:
+            if plan.kind == PLAN_KIND_COMMAND:
+                stdout_text, stderr_text, exit_code = await self._exec_command(
+                    connection.client,
+                    plan.payload["command"],
+                    int(plan.payload.get("timeout", DEFAULT_COMMAND_TIMEOUT)),
+                )
+                plan.status = PLAN_STATUS_EXECUTED
+                plan.executed_at = time.time()
+                plan.verification = f"Command exit code {exit_code}"
+                self._save_plans()
+                self._audit_event("plan_executed", plan, extra={"exit_code": exit_code})
+                result = f"Plan '{plan_id}' executed.\nCommand: {plan.payload['command']}\nExit Code: {exit_code}\n"
+                if stdout_text:
+                    result += f"\nSTDOUT:\n{stdout_text}\n"
+                if stderr_text:
+                    result += f"\nSTDERR:\n{stderr_text}\n"
+                return [TextContent(type="text", text=result)]
+
+            if plan.kind == PLAN_KIND_FILE_EDIT:
+                remote_path = plan.payload["remote_path"]
+                backup_path = f"{remote_path}.ssh-mcp.bak.{int(time.time())}"
+                new_bytes = plan.payload["new_content"].encode("utf-8")
+                await self._write_remote_file_bytes(
+                    connection,
+                    remote_path,
+                    new_bytes,
+                    backup_path=backup_path,
+                )
+                written_bytes = await self._read_remote_file_bytes(connection, remote_path)
+                written_hash = hashlib.sha256(written_bytes).hexdigest()
+                expected_hash = plan.payload["new_sha256"]
+                if written_hash != expected_hash:
+                    raise RuntimeError(
+                        f"Post-write verification failed for {remote_path}: "
+                        f"expected {expected_hash}, got {written_hash}"
+                    )
+
+                plan.status = PLAN_STATUS_EXECUTED
+                plan.executed_at = time.time()
+                plan.verification = f"Verified SHA256 {written_hash}; backup at {backup_path}"
+                self._save_plans()
+                self._audit_event(
+                    "plan_executed",
+                    plan,
+                    extra={"sha256": written_hash, "backup_path": backup_path},
+                )
+                result = (
+                    f"Plan '{plan_id}' executed.\n"
+                    f"Remote path: {remote_path}\n"
+                    f"Backup path: {backup_path}\n"
+                    f"SHA256: {written_hash}"
+                )
+                return [TextContent(type="text", text=result)]
+
+            if plan.kind == PLAN_KIND_KEY_AUTH:
+                credential_name = str(plan.payload["credential_name"])
+                key_name = str(plan.payload["key_name"])
+                key_comment = str(plan.payload["key_comment"])
+                overwrite_saved_credential = bool(
+                    plan.payload.get("overwrite_saved_credential", False)
+                )
+                await self._bootstrap_key_auth(
+                    client=connection.client,
+                    hostname=connection.hostname,
+                    username=connection.username,
+                    port=connection.port,
+                    credential_name=credential_name,
+                    key_name=key_name,
+                    key_comment=key_comment,
+                    known_hosts_path=connection.known_hosts_path,
+                    overwrite_saved_credential=overwrite_saved_credential,
+                    jump_host=connection.jump_host,
+                )
+                plan.status = PLAN_STATUS_EXECUTED
+                plan.executed_at = time.time()
+                plan.verification = (
+                    f"Installed key auth and saved credential '{credential_name}'"
+                )
+                self._save_plans()
+                self._audit_event(
+                    "plan_executed",
+                    plan,
+                    extra={"credential_name": credential_name, "key_name": key_name},
+                )
+                result = (
+                    f"Plan '{plan_id}' executed.\n"
+                    f"Installed SSH public key on {connection.hostname}\n"
+                    f"Saved credential: {credential_name}\n"
+                    f"Key name: {key_name}"
+                )
+                return [TextContent(type="text", text=result)]
+
+            if plan.kind == PLAN_KIND_UPLOAD:
+                source_path = Path(str(plan.payload["local_path"]))
+                remote_path = str(plan.payload["remote_path"])
+
+                def upload_file() -> None:
+                    sftp = connection.client.open_sftp()
+                    try:
+                        sftp.put(str(source_path), remote_path)
+                    finally:
+                        sftp.close()
+
+                await self._run_blocking(upload_file)
+                remote_hash = await self._remote_file_sha256(connection, remote_path)
+                expected_hash = str(plan.payload["local_sha256"])
+                if remote_hash != expected_hash:
+                    raise RuntimeError(
+                        f"Post-upload verification failed for {remote_path}: "
+                        f"expected {expected_hash}, got {remote_hash}"
+                    )
+
+                plan.status = PLAN_STATUS_EXECUTED
+                plan.executed_at = time.time()
+                plan.verification = f"Verified SHA256 {remote_hash}"
+                self._save_plans()
+                self._audit_event(
+                    "plan_executed",
+                    plan,
+                    extra={"sha256": remote_hash, "remote_path": remote_path},
+                )
+                result = (
+                    f"Plan '{plan_id}' executed.\n"
+                    f"Uploaded: {source_path}\n"
+                    f"Remote path: {remote_path}\n"
+                    f"SHA256: {remote_hash}"
+                )
+                return [TextContent(type="text", text=result)]
+
+            return [TextContent(type="text", text=f"Unsupported plan kind: {plan.kind}")]
+        except paramiko.SSHException as e:
+            connection.connected = False
+            return [TextContent(type="text", text=f"SSH error executing plan: {str(e)}")]
+        except Exception as e:
+            return [TextContent(type="text", text=f"Failed to execute plan: {str(e)}")]
+
     async def _ssh_upload_file(self, args: Dict[str, Any]) -> List[TextContent]:
         """Upload file to remote server via SFTP."""
         connection_name = args["connection_name"]
         local_path = args["local_path"]
         remote_path = args["remote_path"]
 
-        if connection_name not in self.connections:
-            return [TextContent(type="text", text=f"Connection '{connection_name}' not found")]
-
-        connection = self.connections[connection_name]
-        if not connection.connected:
-            return [TextContent(type="text", text=f"Connection '{connection_name}' is not active")]
+        try:
+            connection = self._ensure_connection(connection_name)
+        except (KeyError, RuntimeError) as e:
+            return [TextContent(type="text", text=str(e))]
 
         try:
             source_path = self._validate_local_path(local_path, require_exists=True)
-
-            # Update last used timestamp
-            connection.last_used = time.time()
-
-            def upload_file() -> None:
-                sftp = connection.client.open_sftp()
-                try:
-                    sftp.put(str(source_path), remote_path)
-                finally:
-                    sftp.close()
-
-            await self._run_blocking(upload_file)
-
-            return [TextContent(
-                type="text",
-                text=f"Successfully uploaded {source_path} to {remote_path} on {connection.hostname}"
-            )]
-
         except FileNotFoundError:
             return [TextContent(type="text", text=f"Local file not found: {local_path}")]
         except ValueError as e:
             return [TextContent(type="text", text=str(e))]
-        except paramiko.SFTPError as e:
-            return [TextContent(type="text", text=f"SFTP error: {str(e)}")]
+
+        try:
+            local_bytes = source_path.read_bytes()
         except Exception as e:
-            return [TextContent(type="text", text=f"Failed to upload file: {str(e)}")]
+            return [TextContent(type="text", text=f"Failed to read local file for upload: {str(e)}")]
+
+        plan = self._store_plan(
+            kind=PLAN_KIND_UPLOAD,
+            connection_name=connection_name,
+            approval_required=True,
+            risk="high",
+            operational_risk="contained / partial",
+            approval_summary={
+                "tool": "ssh_execute_plan",
+                "target": connection_name,
+                "action": "Upload local file",
+                "summary": f"{source_path.name} -> {remote_path}",
+                "plan_id": "",
+            },
+            summary=f"Upload local file {source_path.name} to {remote_path}",
+            rollback_plan=(
+                "Remove or replace the uploaded remote file manually if rollback is required."
+            ),
+            payload={
+                "local_path": str(source_path),
+                "remote_path": remote_path,
+                "local_sha256": hashlib.sha256(local_bytes).hexdigest(),
+                "local_bytes": len(local_bytes),
+            },
+        )
+        message = self._format_plan(plan)
+        if plan.payload:
+            message += "\nPayload:\n" + json.dumps(plan.payload, indent=2, sort_keys=True)
+        return [TextContent(type="text", text=message)]
 
     async def _ssh_download_file(self, args: Dict[str, Any]) -> List[TextContent]:
         """Download file from remote server via SFTP."""
@@ -1620,6 +2586,73 @@ class SSHMCPServer:
             connection.connected = False
             return f"Status: Unhealthy ({str(e)})"
 
+    async def _ssh_read_audit_log(self, args: Dict[str, Any]) -> List[TextContent]:
+        """Read and format audit log entries in human-readable form."""
+        limit = int(args.get("limit", 50))
+        event_filter = args.get("event_filter", "").strip().lower()
+
+        EVENT_LABELS = {
+            "plan_created": "CREATED",
+            "plan_approved": "APPROVED",
+            "plan_rejected": "REJECTED",
+            "plan_executed": "EXECUTED",
+            "plan_expired": "EXPIRED",
+        }
+
+        try:
+            raw = self.audit_log.log_path.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            return [TextContent(type="text", text="Audit log does not exist.")]
+
+        if not raw:
+            return [TextContent(type="text", text="Audit log is empty. No events recorded yet.")]
+
+        entries = []
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entries.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+
+        if event_filter:
+            entries = [e for e in entries if e.get("event", "").lower() == event_filter]
+
+        entries = entries[-limit:]
+
+        if not entries:
+            filter_note = f" for event '{event_filter}'" if event_filter else ""
+            return [TextContent(type="text", text=f"No records found{filter_note}.")]
+
+        lines = [f"Audit Log ({len(entries)} entries)\n{'=' * 48}"]
+        for entry in entries:
+            ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(entry.get("ts", 0)))
+            event = entry.get("event", "unknown")
+            label = EVENT_LABELS.get(event, event.upper())
+            plan_id = entry.get("plan_id", "-")
+            kind = entry.get("kind", "-")
+            conn = entry.get("connection_name", "-")
+            risk = entry.get("risk", "-")
+            summary = entry.get("summary", "-")
+
+            lines.append(
+                f"\n[{ts}] {label}"
+                f"\n  Plan       : {plan_id}"
+                f"\n  Kind       : {kind}"
+                f"\n  Connection : {conn}"
+                f"\n  Risk       : {risk}"
+                f"\n  Summary    : {summary}"
+            )
+
+            extra = entry.get("extra")
+            if extra:
+                for k, v in extra.items():
+                    lines.append(f"  {k:10}: {v}")
+
+        return [TextContent(type="text", text="\n".join(lines))]
+
     async def run(self):
         """Run the MCP server."""
         async with stdio_server() as (read_stream, write_stream):
@@ -1628,7 +2661,7 @@ class SSHMCPServer:
                 write_stream,
                 InitializationOptions(
                     server_name="ssh-mcp-server",
-                    server_version="1.0.2",
+                    server_version="1.1.0",
                     capabilities=ServerCapabilities(
                         tools=ToolsCapability()
                     )

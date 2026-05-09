@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ssh-mcp-server"
-version = "1.0.1"
+version = "1.2.0"
 description = "Model Context Protocol server for remote SSH connections"
 authors = [
-    {name = "SSH MCP", email = "ssh-mcp@example.com"}
+    {name = "mohdadil", email = "mohdadil@live.com"}
 ]
 readme = "README.md"
 license = {text = "MIT"}
@@ -28,9 +28,9 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/example/ssh-mcp-server"
-Repository = "https://github.com/example/ssh-mcp-server.git"
-Issues = "https://github.com/example/ssh-mcp-server/issues"
+Homepage = "https://github.com/nqmn/adremote-mcp"
+Repository = "https://github.com/nqmn/adremote-mcp.git"
+Issues = "https://github.com/nqmn/adremote-mcp/issues"
 
 [project.scripts]
 ssh-mcp-server = "ssh_mcp_server:main"
