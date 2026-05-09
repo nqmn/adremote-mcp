@@ -1,6 +1,6 @@
-# SSH Remote MCP Server
+# adremote-mcp
 
-SSH remote access for MCP-compatible clients through Model Context Protocol (MCP).
+MCP server for safe remote SSH operations with plan approval, audit log, and credential management.
 
 ## Quick Start
 

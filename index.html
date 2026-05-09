@@ -1,0 +1,530 @@
+<!DOCTYPE html>
+<html lang="en" class="scroll-smooth">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>adremote-mcp - SSH MCP Server</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=Fira+Code:wght@400;500&display=swap" rel="stylesheet">
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    fontFamily: {
+                        sans: ['Inter', 'sans-serif'],
+                        mono: ['Fira Code', 'monospace'],
+                    },
+                    colors: {
+                        brand: {
+                            400: '#f87171',
+                            500: '#ef4444',
+                            600: '#dc2626',
+                        },
+                        dark: {
+                            900: '#0f1115',
+                            800: '#161b22',
+                            700: '#21262d',
+                        }
+                    }
+                }
+            }
+        };
+    </script>
+    <style>
+        body {
+            background-color: #050505;
+            color: #ffffff;
+            background-image:
+                radial-gradient(circle at 15% 50%, rgba(239, 68, 68, 0.07) 0%, transparent 40%),
+                radial-gradient(circle at 85% 30%, rgba(220, 38, 38, 0.06) 0%, transparent 40%);
+            background-attachment: fixed;
+            overflow-x: hidden;
+        }
+
+        .gradient-text {
+            background: linear-gradient(to right, #f87171, #fca5a5);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .glass-panel {
+            background: rgba(22, 27, 34, 0.6);
+            backdrop-filter: blur(12px);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+        }
+
+        .terminal-glow {
+            box-shadow: 0 0 60px -15px rgba(239, 68, 68, 0.2);
+        }
+
+        .accordion-content {
+            transition: max-height 0.3s ease-in-out, opacity 0.3s ease-in-out, padding 0.3s ease;
+            max-height: 0;
+            opacity: 0;
+            overflow: hidden;
+        }
+
+        .accordion-content.open {
+            max-height: 240px;
+            opacity: 1;
+            padding-bottom: 1.5rem;
+        }
+
+        .accordion-icon {
+            transition: transform 0.3s ease;
+        }
+
+        .accordion-button.active .accordion-icon {
+            transform: rotate(45deg);
+        }
+
+        .mobile-menu {
+            transition: max-height 0.3s ease, opacity 0.3s ease, padding 0.3s ease;
+            max-height: 0;
+            opacity: 0;
+            overflow: hidden;
+        }
+
+        .mobile-menu.open {
+            max-height: 320px;
+            opacity: 1;
+        }
+    </style>
+</head>
+<body class="antialiased min-h-screen flex flex-col font-sans selection:bg-brand-500 selection:text-white">
+
+    <nav class="fixed top-0 w-full z-50 glass-panel border-b border-white/5">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="flex items-center justify-between h-16">
+                <div class="flex items-center gap-2 cursor-pointer">
+                    <i data-lucide="terminal" class="w-6 h-6 text-brand-400"></i>
+                    <span class="font-bold text-xl tracking-tight">adremote-mcp</span>
+                </div>
+                <div class="hidden md:flex items-center space-x-8 text-sm font-medium text-gray-300">
+                    <a href="https://github.com/nqmn/adremote-mcp" target="_blank" rel="noreferrer" class="hover:text-white transition-colors flex items-center gap-2">
+                        <i data-lucide="github" class="w-4 h-4"></i> GitHub
+                    </a>
+                    <a href="https://github.com/nqmn/adremote-mcp/blob/main/README.md" target="_blank" rel="noreferrer" class="hover:text-white transition-colors flex items-center gap-2">
+                        <i data-lucide="book" class="w-4 h-4"></i> Docs
+                    </a>
+                    <a href="#install" class="bg-white/10 hover:bg-white/20 text-white px-4 py-2 rounded-lg transition-all border border-white/10">
+                        Get Started
+                    </a>
+                </div>
+                <button id="mobile-menu-button" class="md:hidden inline-flex items-center justify-center p-2 rounded-lg border border-white/10 bg-white/5 text-gray-200 hover:bg-white/10 transition-colors" aria-label="Open navigation menu" aria-expanded="false" aria-controls="mobile-menu" onclick="toggleMobileMenu()">
+                    <i data-lucide="menu" class="w-5 h-5"></i>
+                </button>
+            </div>
+            <div id="mobile-menu" class="mobile-menu md:hidden">
+                <div class="pb-4 flex flex-col gap-2 text-sm font-medium text-gray-300">
+                    <a href="#terminal" class="px-3 py-2 rounded-lg hover:bg-white/5 transition-colors" onclick="closeMobileMenu()">See how it works</a>
+                    <a href="#tools" class="px-3 py-2 rounded-lg hover:bg-white/5 transition-colors" onclick="closeMobileMenu()">Tools</a>
+                    <a href="#faq" class="px-3 py-2 rounded-lg hover:bg-white/5 transition-colors" onclick="closeMobileMenu()">FAQ</a>
+                    <a href="https://github.com/nqmn/adremote-mcp/blob/main/README.md" target="_blank" rel="noreferrer" class="px-3 py-2 rounded-lg hover:bg-white/5 transition-colors" onclick="closeMobileMenu()">Docs</a>
+                    <a href="https://github.com/nqmn/adremote-mcp" target="_blank" rel="noreferrer" class="px-3 py-2 rounded-lg hover:bg-white/5 transition-colors" onclick="closeMobileMenu()">GitHub</a>
+                    <a href="#install" class="mt-2 bg-white/10 hover:bg-white/20 text-white px-4 py-3 rounded-lg transition-all border border-white/10 text-center" onclick="closeMobileMenu()">
+                        Get Started
+                    </a>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main class="flex-grow pt-32 pb-20">
+        <section class="max-w-5xl mx-auto px-4 sm:px-6 lg:px-8 text-center">
+            <div class="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-brand-500/10 border border-brand-500/20 text-brand-400 text-xs font-semibold mb-8">
+                <i data-lucide="shield" class="w-3 h-3"></i>
+                <span>v1.2.0 — Plan-and-approve SSH for MCP</span>
+            </div>
+
+            <h1 class="text-5xl md:text-7xl font-extrabold tracking-tight mb-6 leading-tight">
+                SSH into anything. <br class="hidden md:block">
+                <span class="gradient-text">Safely, from your AI.</span>
+            </h1>
+
+            <p class="text-lg md:text-xl text-gray-400 mb-10 max-w-3xl mx-auto leading-relaxed">
+                adremote-mcp is an MCP server that gives Claude and other AI clients safe, audited SSH access to remote servers —
+                with a plan-and-approve flow, credential management, file transfers, and a human-readable audit log.
+            </p>
+
+            <div class="flex flex-col sm:flex-row justify-center items-center gap-4 mb-20">
+                <a href="https://github.com/nqmn/adremote-mcp" target="_blank" rel="noreferrer" class="w-full sm:w-auto flex items-center justify-center gap-2 bg-brand-500 hover:bg-brand-400 text-white font-semibold px-6 py-3 rounded-xl transition-all shadow-[0_0_20px_rgba(239,68,68,0.3)] hover:shadow-[0_0_30px_rgba(239,68,68,0.5)]">
+                    <i data-lucide="star" class="w-5 h-5 fill-current"></i>
+                    Star on GitHub
+                </a>
+                <a href="#terminal" class="w-full sm:w-auto flex items-center justify-center gap-2 glass-panel hover:bg-white/10 text-white font-semibold px-6 py-3 rounded-xl transition-all border border-white/10">
+                    See how it works
+                </a>
+            </div>
+
+            <div id="terminal" class="max-w-4xl mx-auto bg-dark-800 rounded-2xl overflow-hidden border border-white/10 terminal-glow text-left">
+                <div class="flex items-center px-4 py-3 bg-[#0d1117] border-b border-white/5">
+                    <div class="flex gap-2">
+                        <div class="w-3 h-3 rounded-full bg-red-500/80"></div>
+                        <div class="w-3 h-3 rounded-full bg-yellow-500/80"></div>
+                        <div class="w-3 h-3 rounded-full bg-green-500/80"></div>
+                    </div>
+                    <div class="mx-auto text-xs text-gray-500 font-mono">claude — ssh-remote mcp</div>
+                </div>
+                <div class="p-6 font-mono text-sm md:text-base leading-relaxed overflow-x-auto">
+                    <div class="text-gray-500 mb-3"># Connect to a remote server</div>
+                    <div class="text-gray-300 mb-1"><span class="text-brand-400">user:</span> ssh 192.168.1.100:22 ubuntu mypass</div>
+                    <div class="text-emerald-400 mb-4">Connected: ubuntu@192.168.1.100 — credential saved as "ubuntu-home"</div>
+
+                    <div class="text-gray-500 mb-3"># Safe commands run directly</div>
+                    <div class="text-gray-300 mb-1"><span class="text-brand-400">user:</span> run ls /home on the server</div>
+                    <div class="text-emerald-400 mb-4">ubuntu  backup  logs</div>
+
+                    <div class="text-gray-500 mb-3"># Risky commands go through plan-and-approve</div>
+                    <div class="text-gray-300 mb-1"><span class="text-brand-400">user:</span> run systemctl restart nginx</div>
+                    <div class="text-yellow-300 mb-1">Plan ID  : plan-3a9f12c04e81</div>
+                    <div class="text-yellow-300 mb-1">Kind     : command</div>
+                    <div class="text-yellow-300 mb-1">Risk     : high — approve before execution</div>
+                    <div class="text-gray-300 mb-1"><span class="text-brand-400">user:</span> approve plan-3a9f12c04e81</div>
+                    <div class="text-emerald-400">Approved. Execute with ssh_execute_plan.</div>
+                </div>
+            </div>
+        </section>
+
+        <section class="max-w-5xl mx-auto px-4 sm:px-6 lg:px-8 mt-24">
+            <div class="grid grid-cols-2 md:grid-cols-4 gap-8 text-center border-y border-white/5 py-12">
+                <div>
+                    <div class="text-4xl font-bold text-white mb-2">20+</div>
+                    <div class="text-xs tracking-widest text-gray-500 uppercase">MCP Tools<br>Exposed</div>
+                </div>
+                <div>
+                    <div class="text-4xl font-bold text-white mb-2">24h</div>
+                    <div class="text-xs tracking-widest text-gray-500 uppercase">Plan TTL<br>with Audit Log</div>
+                </div>
+                <div>
+                    <div class="text-4xl font-bold text-white mb-2">SFTP</div>
+                    <div class="text-xs tracking-widest text-gray-500 uppercase">File Upload<br>&amp; Download</div>
+                </div>
+                <div>
+                    <div class="text-4xl font-bold text-white mb-2">0</div>
+                    <div class="text-xs tracking-widest text-gray-500 uppercase">Unreviewed<br>Destructive Runs</div>
+                </div>
+            </div>
+        </section>
+
+        <section id="tools" class="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 mt-32">
+            <div class="text-center mb-16">
+                <h2 class="text-3xl font-bold mb-4">Safe by design, not by convention</h2>
+                <p class="text-gray-400 max-w-2xl mx-auto">
+                    Every non-trivial command goes through a structured review gate. Your AI proposes, you approve, the server executes — with a full audit trail.
+                </p>
+            </div>
+
+            <div class="grid md:grid-cols-2 gap-6 text-left">
+                <div class="glass-panel p-8 rounded-2xl border border-red-500/20 bg-gradient-to-b from-transparent to-red-950/10">
+                    <div class="text-xs text-red-400 font-bold tracking-wider mb-6">WITHOUT — Unguarded AI Shell Access</div>
+                    <ul class="space-y-4">
+                        <li class="flex items-start gap-3 text-gray-400">
+                            <i data-lucide="x" class="w-5 h-5 text-red-500 shrink-0 mt-0.5"></i>
+                            <span>AI runs commands directly with <b>no review gate</b>.</span>
+                        </li>
+                        <li class="flex items-start gap-3 text-gray-400">
+                            <i data-lucide="x" class="w-5 h-5 text-red-500 shrink-0 mt-0.5"></i>
+                            <span>No audit trail — <b>impossible to know</b> what ran and when.</span>
+                        </li>
+                        <li class="flex items-start gap-3 text-gray-400">
+                            <i data-lucide="x" class="w-5 h-5 text-red-500 shrink-0 mt-0.5"></i>
+                            <span>Credentials stored insecurely or re-entered every session.</span>
+                        </li>
+                        <li class="flex items-start gap-3 text-gray-400">
+                            <i data-lucide="x" class="w-5 h-5 text-red-500 shrink-0 mt-0.5"></i>
+                            <span>File edits overwrite with <b>no backup and no hash check</b>.</span>
+                        </li>
+                        <li class="flex items-start gap-3 text-red-400/80 bg-red-500/10 p-4 rounded-xl mt-6 text-sm border border-red-500/10">
+                            <i data-lucide="alert-triangle" class="w-5 h-5 shrink-0"></i>
+                            One hallucinated command can break production. There is no rollback.
+                        </li>
+                    </ul>
+                </div>
+
+                <div class="glass-panel p-8 rounded-2xl border border-brand-500/30 bg-gradient-to-b from-brand-900/10 to-transparent relative overflow-hidden">
+                    <div class="text-xs text-brand-400 font-bold tracking-wider mb-6 relative z-10">WITH adremote-mcp</div>
+                    <ul class="space-y-4 relative z-10">
+                        <li class="flex items-start gap-3 text-gray-200">
+                            <i data-lucide="check" class="w-5 h-5 text-brand-400 shrink-0 mt-0.5"></i>
+                            <span>Safe commands (<code class="text-brand-300 bg-black/30 px-1 rounded">ls</code>, <code class="text-brand-300 bg-black/30 px-1 rounded">pwd</code>, <code class="text-brand-300 bg-black/30 px-1 rounded">whoami</code>) run directly. Everything else needs a plan.</span>
+                        </li>
+                        <li class="flex items-start gap-3 text-gray-200">
+                            <i data-lucide="check" class="w-5 h-5 text-brand-400 shrink-0 mt-0.5"></i>
+                            <span>Every plan shows <b>full details</b> — risk level, rollback plan, and payload — before you approve.</span>
+                        </li>
+                        <li class="flex items-start gap-3 text-gray-200">
+                            <i data-lucide="check" class="w-5 h-5 text-brand-400 shrink-0 mt-0.5"></i>
+                            <span>Credentials saved locally with key-based auth — <b>no passwords re-entered</b>.</span>
+                        </li>
+                        <li class="flex items-start gap-3 text-gray-200">
+                            <i data-lucide="check" class="w-5 h-5 text-brand-400 shrink-0 mt-0.5"></i>
+                            <span>File edits create a timestamped backup and <b>verify SHA256</b> after writing.</span>
+                        </li>
+                        <li class="flex items-start gap-3 text-gray-200">
+                            <i data-lucide="check" class="w-5 h-5 text-brand-400 shrink-0 mt-0.5"></i>
+                            <span>Human-readable audit log via <code class="text-brand-300 bg-black/30 px-1 rounded">ssh_read_audit_log</code>.</span>
+                        </li>
+                    </ul>
+                    <div class="mt-8 pt-6 border-t border-white/10 relative z-10">
+                        <p class="text-sm text-brand-300">Your AI proposes. You approve. The server executes. Always.</p>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <section class="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 mt-32">
+            <div class="text-center mb-16">
+                <h2 class="text-3xl font-bold mb-4">Tool Groups</h2>
+                <p class="text-gray-400 max-w-2xl mx-auto">
+                    20+ MCP tools organized across five capability areas.
+                </p>
+            </div>
+
+            <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                <div class="glass-panel p-6 rounded-2xl border border-white/10 hover:border-brand-500/30 transition-colors">
+                    <div class="flex items-center gap-4 mb-4">
+                        <div class="p-3 bg-brand-500/10 rounded-xl text-brand-400">
+                            <i data-lucide="plug" class="w-6 h-6"></i>
+                        </div>
+                        <h3 class="text-lg font-bold text-white">Connection</h3>
+                    </div>
+                    <ul class="space-y-2 text-sm text-gray-400 font-mono">
+                        <li>ssh_connect</li>
+                        <li>ssh_connect_saved</li>
+                        <li>ssh_disconnect</li>
+                        <li>ssh_list_connections</li>
+                        <li>ssh_health_check</li>
+                    </ul>
+                </div>
+
+                <div class="glass-panel p-6 rounded-2xl border border-white/10 hover:border-brand-500/30 transition-colors">
+                    <div class="flex items-center gap-4 mb-4">
+                        <div class="p-3 bg-brand-500/10 rounded-xl text-brand-400">
+                            <i data-lucide="shield-check" class="w-6 h-6"></i>
+                        </div>
+                        <h3 class="text-lg font-bold text-white">Plan &amp; Approve</h3>
+                    </div>
+                    <ul class="space-y-2 text-sm text-gray-400 font-mono">
+                        <li>ssh_execute</li>
+                        <li>ssh_plan_command</li>
+                        <li>ssh_approve_plan</li>
+                        <li>ssh_reject_plan</li>
+                        <li>ssh_execute_plan</li>
+                        <li>ssh_list_plans</li>
+                        <li>ssh_get_plan</li>
+                    </ul>
+                </div>
+
+                <div class="glass-panel p-6 rounded-2xl border border-white/10 hover:border-brand-500/30 transition-colors">
+                    <div class="flex items-center gap-4 mb-4">
+                        <div class="p-3 bg-brand-500/10 rounded-xl text-brand-400">
+                            <i data-lucide="file-edit" class="w-6 h-6"></i>
+                        </div>
+                        <h3 class="text-lg font-bold text-white">File Management</h3>
+                    </div>
+                    <ul class="space-y-2 text-sm text-gray-400 font-mono">
+                        <li>ssh_read_file</li>
+                        <li>ssh_plan_edit</li>
+                        <li>ssh_upload_file</li>
+                        <li>ssh_download_file</li>
+                    </ul>
+                </div>
+
+                <div class="glass-panel p-6 rounded-2xl border border-white/10 hover:border-brand-500/30 transition-colors">
+                    <div class="flex items-center gap-4 mb-4">
+                        <div class="p-3 bg-brand-500/10 rounded-xl text-brand-400">
+                            <i data-lucide="key-round" class="w-6 h-6"></i>
+                        </div>
+                        <h3 class="text-lg font-bold text-white">Credentials</h3>
+                    </div>
+                    <ul class="space-y-2 text-sm text-gray-400 font-mono">
+                        <li>ssh_save_credentials</li>
+                        <li>ssh_list_saved_credentials</li>
+                        <li>ssh_delete_saved_credentials</li>
+                        <li>ssh_setup_key_auth</li>
+                    </ul>
+                </div>
+
+                <div class="glass-panel p-6 rounded-2xl border border-white/10 hover:border-brand-500/30 transition-colors">
+                    <div class="flex items-center gap-4 mb-4">
+                        <div class="p-3 bg-brand-500/10 rounded-xl text-brand-400">
+                            <i data-lucide="scroll-text" class="w-6 h-6"></i>
+                        </div>
+                        <h3 class="text-lg font-bold text-white">Audit Log</h3>
+                    </div>
+                    <ul class="space-y-2 text-sm text-gray-400 font-mono">
+                        <li>ssh_read_audit_log</li>
+                    </ul>
+                    <p class="text-xs text-gray-500 mt-4">Supports <span class="font-mono">limit</span> and <span class="font-mono">event_filter</span> params. Events: created, approved, rejected, executed, expired.</p>
+                </div>
+            </div>
+        </section>
+
+        <section id="faq" class="max-w-3xl mx-auto px-4 sm:px-6 lg:px-8 mt-32">
+            <h2 class="text-3xl font-bold mb-10 text-center">Common questions</h2>
+
+            <div class="space-y-4">
+                <div class="glass-panel rounded-xl border border-white/10 overflow-hidden">
+                    <button class="accordion-button w-full flex justify-between items-center p-6 text-left hover:bg-white/5 transition-colors focus:outline-none" onclick="toggleAccordion(this)">
+                        <span class="font-medium text-lg text-white">Which commands run directly without a plan?</span>
+                        <i data-lucide="plus" class="w-5 h-5 text-gray-400 accordion-icon"></i>
+                    </button>
+                    <div class="accordion-content px-6 text-gray-400">
+                        A small allowlist of read-only commands: <code class="bg-black/30 px-1 rounded text-brand-300">date</code>, <code class="bg-black/30 px-1 rounded text-brand-300">hostname</code>, <code class="bg-black/30 px-1 rounded text-brand-300">id</code>, <code class="bg-black/30 px-1 rounded text-brand-300">ls</code>, <code class="bg-black/30 px-1 rounded text-brand-300">pwd</code>, <code class="bg-black/30 px-1 rounded text-brand-300">uname</code>, <code class="bg-black/30 px-1 rounded text-brand-300">uptime</code>, <code class="bg-black/30 px-1 rounded text-brand-300">whoami</code>. Everything else — including shell composition, pipes, and high-risk prefixes like <code class="bg-black/30 px-1 rounded text-brand-300">rm</code>, <code class="bg-black/30 px-1 rounded text-brand-300">systemctl</code>, <code class="bg-black/30 px-1 rounded text-brand-300">curl</code> — is routed through a plan.
+                    </div>
+                </div>
+
+                <div class="glass-panel rounded-xl border border-white/10 overflow-hidden">
+                    <button class="accordion-button w-full flex justify-between items-center p-6 text-left hover:bg-white/5 transition-colors focus:outline-none" onclick="toggleAccordion(this)">
+                        <span class="font-medium text-lg text-white">What happens if I don't approve a plan in time?</span>
+                        <i data-lucide="plus" class="w-5 h-5 text-gray-400 accordion-icon"></i>
+                    </button>
+                    <div class="accordion-content px-6 text-gray-400">
+                        Plans expire after 24 hours. An expired plan is automatically marked as rejected and cannot be executed. You would need to recreate it. Plans are persisted locally so they survive MCP server restarts within that window.
+                    </div>
+                </div>
+
+                <div class="glass-panel rounded-xl border border-white/10 overflow-hidden">
+                    <button class="accordion-button w-full flex justify-between items-center p-6 text-left hover:bg-white/5 transition-colors focus:outline-none" onclick="toggleAccordion(this)">
+                        <span class="font-medium text-lg text-white">How are credentials stored?</span>
+                        <i data-lucide="plus" class="w-5 h-5 text-gray-400 accordion-icon"></i>
+                    </button>
+                    <div class="accordion-content px-6 text-gray-400">
+                        Credentials are saved locally in <code class="bg-black/30 px-1 rounded text-brand-300">~/.ssh_mcp_credentials.json</code> with 0600 permissions. The first password-based login automatically bootstraps key-based auth and saves the key credential — the password is never stored. Passphrase-protected private keys are also supported and stored alongside the credential.
+                    </div>
+                </div>
+
+                <div class="glass-panel rounded-xl border border-white/10 overflow-hidden">
+                    <button class="accordion-button w-full flex justify-between items-center p-6 text-left hover:bg-white/5 transition-colors focus:outline-none" onclick="toggleAccordion(this)">
+                        <span class="font-medium text-lg text-white">Does it support jump hosts / bastions?</span>
+                        <i data-lucide="plus" class="w-5 h-5 text-gray-400 accordion-icon"></i>
+                    </button>
+                    <div class="accordion-content px-6 text-gray-400">
+                        Yes. Pass a <code class="bg-black/30 px-1 rounded text-brand-300">jump_host</code> object on <code class="bg-black/30 px-1 rounded text-brand-300">ssh_connect</code> or <code class="bg-black/30 px-1 rounded text-brand-300">ssh_save_credentials</code>. The server opens a native SSH tunnel through the bastion to the target. Jump host keys can also be passphrase-protected.
+                    </div>
+                </div>
+
+                <div class="glass-panel rounded-xl border border-white/10 overflow-hidden">
+                    <button class="accordion-button w-full flex justify-between items-center p-6 text-left hover:bg-white/5 transition-colors focus:outline-none" onclick="toggleAccordion(this)">
+                        <span class="font-medium text-lg text-white">How do remote file edits work?</span>
+                        <i data-lucide="plus" class="w-5 h-5 text-gray-400 accordion-icon"></i>
+                    </button>
+                    <div class="accordion-content px-6 text-gray-400">
+                        Use <code class="bg-black/30 px-1 rounded text-brand-300">ssh_read_file</code> to read the current content, then <code class="bg-black/30 px-1 rounded text-brand-300">ssh_plan_edit</code> to stage the new content. After approval and execution, the server creates a timestamped <code class="bg-black/30 px-1 rounded text-brand-300">.ssh-mcp.bak.&lt;ts&gt;</code> backup and verifies the written file's SHA256 hash before reporting success.
+                    </div>
+                </div>
+
+                <div class="glass-panel rounded-xl border border-white/10 overflow-hidden">
+                    <button class="accordion-button w-full flex justify-between items-center p-6 text-left hover:bg-white/5 transition-colors focus:outline-none" onclick="toggleAccordion(this)">
+                        <span class="font-medium text-lg text-white">Which MCP clients are supported?</span>
+                        <i data-lucide="plus" class="w-5 h-5 text-gray-400 accordion-icon"></i>
+                    </button>
+                    <div class="accordion-content px-6 text-gray-400">
+                        Any MCP-compatible client — Claude Desktop, Claude Code, and Codex are all supported. The server communicates over stdio and is launched as a subprocess by the client. Windows and WSL/Linux are both supported with OS-specific venvs and launcher scripts.
+                    </div>
+                </div>
+
+                <div class="glass-panel rounded-xl border border-white/10 overflow-hidden">
+                    <button class="accordion-button w-full flex justify-between items-center p-6 text-left hover:bg-white/5 transition-colors focus:outline-none" onclick="toggleAccordion(this)">
+                        <span class="font-medium text-lg text-white">What does the audit log record?</span>
+                        <i data-lucide="plus" class="w-5 h-5 text-gray-400 accordion-icon"></i>
+                    </button>
+                    <div class="accordion-content px-6 text-gray-400">
+                        Every plan lifecycle event: created, approved, rejected, executed, and expired. Each entry includes timestamp, plan ID, kind, connection name, risk level, and a summary. Use <code class="bg-black/30 px-1 rounded text-brand-300">ssh_read_audit_log</code> to view it in a formatted, human-readable layout — no need to read raw JSONL.
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <section id="install" class="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 mt-32 text-center">
+            <h2 class="text-3xl font-bold mb-6">Start in two steps.</h2>
+            <p class="text-gray-400 mb-10">Clone the repo, run the installer for your OS, then add the server to your MCP client config.</p>
+
+            <div class="grid md:grid-cols-2 gap-6 text-left mb-10">
+                <div class="glass-panel p-6 rounded-2xl border border-white/10">
+                    <div class="text-xs text-brand-400 font-bold tracking-wider mb-4">WINDOWS</div>
+                    <div class="font-mono text-sm text-gray-300 space-y-2">
+                        <div><span class="text-gray-500">1.</span> <span class="text-brand-300">git clone</span> https://github.com/nqmn/adremote-mcp</div>
+                        <div><span class="text-gray-500">2.</span> <span class="text-brand-300">.\install.ps1</span></div>
+                        <div class="pt-2 text-gray-500 text-xs">Then add to MCP config:</div>
+                        <div class="bg-black/30 p-3 rounded-lg text-xs text-gray-300 mt-1">
+                            "command": ".venv-win\Scripts\python.exe"<br>
+                            "args": ["ssh_mcp_server.py"]
+                        </div>
+                    </div>
+                </div>
+                <div class="glass-panel p-6 rounded-2xl border border-white/10">
+                    <div class="text-xs text-brand-400 font-bold tracking-wider mb-4">WSL / LINUX</div>
+                    <div class="font-mono text-sm text-gray-300 space-y-2">
+                        <div><span class="text-gray-500">1.</span> <span class="text-brand-300">git clone</span> https://github.com/nqmn/adremote-mcp</div>
+                        <div><span class="text-gray-500">2.</span> <span class="text-brand-300">./install.sh</span></div>
+                        <div class="pt-2 text-gray-500 text-xs">Then add to MCP config:</div>
+                        <div class="bg-black/30 p-3 rounded-lg text-xs text-gray-300 mt-1">
+                            "command": ".venv-linux/bin/python"<br>
+                            "args": ["ssh_mcp_server.py"]
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <a href="https://github.com/nqmn/adremote-mcp/blob/main/README.md" target="_blank" rel="noreferrer" class="inline-flex items-center gap-2 bg-brand-500 hover:bg-brand-400 text-white font-semibold px-6 py-3.5 rounded-xl transition-all shadow-[0_0_15px_rgba(239,68,68,0.2)]">
+                <i data-lucide="book-open" class="w-5 h-5"></i>
+                Full Documentation
+            </a>
+        </section>
+    </main>
+
+    <footer class="border-t border-white/5 py-8 mt-auto">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex flex-col md:flex-row items-center justify-between gap-4">
+            <div class="flex items-center gap-2 text-gray-500 text-sm">
+                <i data-lucide="terminal" class="w-4 h-4"></i>
+                <span>© 2026 Mohd Adil — <a href="mailto:mohdadil@live.com" class="hover:text-white transition-colors">mohdadil@live.com</a> — MIT License</span>
+            </div>
+            <div class="flex gap-6 text-gray-500">
+                <a href="https://github.com/nqmn/adremote-mcp" target="_blank" rel="noreferrer" class="hover:text-white transition-colors">
+                    <i data-lucide="github" class="w-5 h-5"></i>
+                </a>
+            </div>
+        </div>
+    </footer>
+
+    <script>
+        lucide.createIcons();
+
+        function toggleMobileMenu() {
+            const menu = document.getElementById('mobile-menu');
+            const button = document.getElementById('mobile-menu-button');
+            const isOpen = menu.classList.contains('open');
+            menu.classList.toggle('open', !isOpen);
+            button.setAttribute('aria-expanded', String(!isOpen));
+        }
+
+        function closeMobileMenu() {
+            const menu = document.getElementById('mobile-menu');
+            const button = document.getElementById('mobile-menu-button');
+            menu.classList.remove('open');
+            button.setAttribute('aria-expanded', 'false');
+        }
+
+        function toggleAccordion(button) {
+            const content = button.nextElementSibling;
+            const isOpen = content.classList.contains('open');
+
+            document.querySelectorAll('.accordion-content').forEach((el) => {
+                el.classList.remove('open');
+            });
+            document.querySelectorAll('.accordion-button').forEach((el) => {
+                el.classList.remove('active');
+            });
+
+            if (!isOpen) {
+                content.classList.add('open');
+                button.classList.add('active');
+            }
+        }
+    </script>
+</body>
+</html>

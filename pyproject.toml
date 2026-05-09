@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "ssh-mcp-server"
 version = "1.2.0"
-description = "Model Context Protocol server for remote SSH connections"
+description = "MCP server for safe remote SSH operations with plan approval, audit log, and credential management"
 authors = [
     {name = "mohdadil", email = "mohdadil@live.com"}
 ]
