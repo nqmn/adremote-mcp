@@ -50,6 +50,10 @@ PLAN_KIND_COMMAND = "command"
 PLAN_KIND_FILE_EDIT = "file_edit"
 PLAN_KIND_UPLOAD = "upload"
 PLAN_KIND_KEY_AUTH = "key_auth"
+CONFIG_FILE = "config.json"
+AUTO_MODE_ENABLED = "enabled"
+AUTO_MODE_DISABLED = "disabled"
+SUPPORTED_AUTO_MODES = {AUTO_MODE_ENABLED, AUTO_MODE_DISABLED}
 SAFE_DIRECT_COMMANDS = {
     "date",
     "hostname",
@@ -329,6 +333,7 @@ class SSHMCPServer:
         self.server = Server("ssh-mcp-server")
         self.connections: Dict[str, SSHConnection] = {}
         self.workspace_dir = Path.cwd().resolve(strict=False)
+        self.config_path = Path(__file__).resolve().with_name(CONFIG_FILE)
         self.allowed_local_roots = self._load_allowed_local_roots()
         self.credential_store = CredentialStore(Path.home() / CREDENTIAL_STORE_FILE)
         self.plan_store = PlanStore(Path.home() / PLAN_STORE_FILE)
@@ -358,6 +363,184 @@ class SSHMCPServer:
 
     def _allowed_roots_text(self) -> str:
         return ", ".join(str(root) for root in self.allowed_local_roots)
+
+    def _load_server_config(self) -> Dict[str, Any]:
+        if not self.config_path.exists():
+            return {}
+
+        try:
+            raw_text = self.config_path.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            logger.warning("Failed to read config file %s: %s", self.config_path, exc)
+            return {}
+
+        if not raw_text:
+            return {}
+
+        try:
+            data = json.loads(raw_text)
+        except json.JSONDecodeError as exc:
+            logger.warning("Failed to parse config file %s: %s", self.config_path, exc)
+            return {}
+
+        if not isinstance(data, dict):
+            logger.warning("Config file %s must contain a JSON object", self.config_path)
+            return {}
+
+        return data
+
+    def _auto_mode_enabled(self) -> bool:
+        config = self._load_server_config()
+        raw_mode = str(config.get("auto-mode", AUTO_MODE_DISABLED)).strip().lower()
+        if raw_mode not in SUPPORTED_AUTO_MODES:
+            logger.warning(
+                "Unsupported auto-mode %r in %s. Falling back to %s.",
+                raw_mode,
+                self.config_path,
+                AUTO_MODE_DISABLED,
+            )
+            return False
+        return raw_mode == AUTO_MODE_ENABLED
+
+    def _auto_approve_plan(self, plan: ExecutionPlan, source_task: str) -> None:
+        note = f"Auto-approved by {self.config_path.name} for task '{source_task}'."
+        plan.status = PLAN_STATUS_APPROVED
+        plan.approved_at = time.time()
+        plan.approval_note = note
+        self._save_plans()
+        self._audit_event("plan_approved", plan, extra={"approval_note": note, "auto_approved": True})
+
+    async def _execute_plan_instance(self, plan: ExecutionPlan) -> str:
+        connection = self._ensure_connection(plan.connection_name)
+        connection.last_used = time.time()
+
+        if plan.kind == PLAN_KIND_COMMAND:
+            stdout_text, stderr_text, exit_code = await self._exec_command(
+                connection.client,
+                plan.payload["command"],
+                int(plan.payload.get("timeout", DEFAULT_COMMAND_TIMEOUT)),
+            )
+            plan.status = PLAN_STATUS_EXECUTED
+            plan.executed_at = time.time()
+            plan.verification = f"Command exit code {exit_code}"
+            self._save_plans()
+            self._audit_event("plan_executed", plan, extra={"exit_code": exit_code})
+            result = f"Plan '{plan.plan_id}' executed.\nCommand: {plan.payload['command']}\nExit Code: {exit_code}\n"
+            if stdout_text:
+                result += f"\nSTDOUT:\n{stdout_text}\n"
+            if stderr_text:
+                result += f"\nSTDERR:\n{stderr_text}\n"
+            return result
+
+        if plan.kind == PLAN_KIND_FILE_EDIT:
+            remote_path = plan.payload["remote_path"]
+            backup_path = f"{remote_path}.ssh-mcp.bak.{int(time.time())}"
+            new_bytes = plan.payload["new_content"].encode("utf-8")
+            await self._write_remote_file_bytes(
+                connection,
+                remote_path,
+                new_bytes,
+                backup_path=backup_path,
+            )
+            written_bytes = await self._read_remote_file_bytes(connection, remote_path)
+            written_hash = hashlib.sha256(written_bytes).hexdigest()
+            expected_hash = plan.payload["new_sha256"]
+            if written_hash != expected_hash:
+                raise RuntimeError(
+                    f"Post-write verification failed for {remote_path}: "
+                    f"expected {expected_hash}, got {written_hash}"
+                )
+
+            plan.status = PLAN_STATUS_EXECUTED
+            plan.executed_at = time.time()
+            plan.verification = f"Verified SHA256 {written_hash}; backup at {backup_path}"
+            self._save_plans()
+            self._audit_event(
+                "plan_executed",
+                plan,
+                extra={"sha256": written_hash, "backup_path": backup_path},
+            )
+            return (
+                f"Plan '{plan.plan_id}' executed.\n"
+                f"Remote path: {remote_path}\n"
+                f"Backup path: {backup_path}\n"
+                f"SHA256: {written_hash}"
+            )
+
+        if plan.kind == PLAN_KIND_KEY_AUTH:
+            credential_name = str(plan.payload["credential_name"])
+            key_name = str(plan.payload["key_name"])
+            key_comment = str(plan.payload["key_comment"])
+            overwrite_saved_credential = bool(
+                plan.payload.get("overwrite_saved_credential", False)
+            )
+            await self._bootstrap_key_auth(
+                client=connection.client,
+                hostname=connection.hostname,
+                username=connection.username,
+                port=connection.port,
+                credential_name=credential_name,
+                key_name=key_name,
+                key_comment=key_comment,
+                known_hosts_path=connection.known_hosts_path,
+                overwrite_saved_credential=overwrite_saved_credential,
+                jump_host=connection.jump_host,
+            )
+            plan.status = PLAN_STATUS_EXECUTED
+            plan.executed_at = time.time()
+            plan.verification = (
+                f"Installed key auth and saved credential '{credential_name}'"
+            )
+            self._save_plans()
+            self._audit_event(
+                "plan_executed",
+                plan,
+                extra={"credential_name": credential_name, "key_name": key_name},
+            )
+            return (
+                f"Plan '{plan.plan_id}' executed.\n"
+                f"Installed SSH public key on {connection.hostname}\n"
+                f"Saved credential: {credential_name}\n"
+                f"Key name: {key_name}"
+            )
+
+        if plan.kind == PLAN_KIND_UPLOAD:
+            source_path = Path(str(plan.payload["local_path"]))
+            remote_path = str(plan.payload["remote_path"])
+
+            def upload_file() -> None:
+                sftp = connection.client.open_sftp()
+                try:
+                    sftp.put(str(source_path), remote_path)
+                finally:
+                    sftp.close()
+
+            await self._run_blocking(upload_file)
+            remote_hash = await self._remote_file_sha256(connection, remote_path)
+            expected_hash = str(plan.payload["local_sha256"])
+            if remote_hash != expected_hash:
+                raise RuntimeError(
+                    f"Post-upload verification failed for {remote_path}: "
+                    f"expected {expected_hash}, got {remote_hash}"
+                )
+
+            plan.status = PLAN_STATUS_EXECUTED
+            plan.executed_at = time.time()
+            plan.verification = f"Verified SHA256 {remote_hash}"
+            self._save_plans()
+            self._audit_event(
+                "plan_executed",
+                plan,
+                extra={"sha256": remote_hash, "remote_path": remote_path},
+            )
+            return (
+                f"Plan '{plan.plan_id}' executed.\n"
+                f"Uploaded: {source_path}\n"
+                f"Remote path: {remote_path}\n"
+                f"SHA256: {remote_hash}"
+            )
+
+        raise RuntimeError(f"Unsupported plan kind: {plan.kind}")
 
     def _validate_local_path(self, raw_path: str, *, require_exists: bool) -> Path:
         """Restrict local file access to explicitly allowed roots."""
@@ -1776,7 +1959,7 @@ class SSHMCPServer:
         plan = self._store_plan(
             kind=PLAN_KIND_KEY_AUTH,
             connection_name=connection_name,
-            approval_required=True,
+            approval_required=not self._auto_mode_enabled(),
             risk="high",
             operational_risk="contained / partial",
             approval_summary={
@@ -1801,10 +1984,21 @@ class SSHMCPServer:
                 "overwrite_saved_credential": overwrite_saved_credential,
             },
         )
-        message = self._format_plan(plan)
-        if plan.payload:
-            message += "\nPayload:\n" + json.dumps(plan.payload, indent=2, sort_keys=True)
-        return [TextContent(type="text", text=message)]
+        if plan.approval_required:
+            message = self._format_plan(plan)
+            if plan.payload:
+                message += "\nPayload:\n" + json.dumps(plan.payload, indent=2, sort_keys=True)
+            return [TextContent(type="text", text=message)]
+
+        self._auto_approve_plan(plan, "ssh_setup_key_auth")
+        try:
+            result = await self._execute_plan_instance(plan)
+            return [TextContent(type="text", text=result)]
+        except paramiko.SSHException as e:
+            connection.connected = False
+            return [TextContent(type="text", text=f"SSH error executing auto-approved plan: {str(e)}")]
+        except Exception as e:
+            return [TextContent(type="text", text=f"Failed to execute auto-approved plan: {str(e)}")]
 
     async def _ssh_execute(self, args: Dict[str, Any]) -> List[TextContent]:
         """Execute command on remote server."""
@@ -1824,7 +2018,7 @@ class SSHMCPServer:
             plan = self._store_plan(
                 kind=PLAN_KIND_COMMAND,
                 connection_name=connection_name,
-                approval_required=True,
+                approval_required=not self._auto_mode_enabled(),
                 risk=risk,
                 operational_risk=operational_risk,
                 approval_summary={
@@ -1842,15 +2036,24 @@ class SSHMCPServer:
                     "classification_reason": classification_reason,
                 },
             )
-            message = self._format_plan(plan)
-            if plan.payload:
-                message += "\nPayload:\n" + json.dumps(plan.payload, indent=2, sort_keys=True)
-            return [TextContent(type="text", text=message)]
+            if plan.approval_required:
+                message = self._format_plan(plan)
+                if plan.payload:
+                    message += "\nPayload:\n" + json.dumps(plan.payload, indent=2, sort_keys=True)
+                return [TextContent(type="text", text=message)]
+
+            self._auto_approve_plan(plan, "ssh_execute")
+            try:
+                result = await self._execute_plan_instance(plan)
+                return [TextContent(type="text", text=result)]
+            except paramiko.SSHException as e:
+                connection.connected = False
+                return [TextContent(type="text", text=f"SSH error executing auto-approved plan: {str(e)}")]
+            except Exception as e:
+                return [TextContent(type="text", text=f"Failed to execute auto-approved plan: {str(e)}")]
 
         try:
-            # Update last used timestamp
             connection.last_used = time.time()
-
             stdout_text, stderr_text, exit_code = await self._exec_command(
                 connection.client, command, timeout
             )
@@ -1865,12 +2068,11 @@ class SSHMCPServer:
                 result += f"STDERR:\n{stderr_text}\n"
 
             return [TextContent(type="text", text=result)]
-
         except paramiko.SSHException as e:
             connection.connected = False
-            return [TextContent(type="text", text=f"SSH error executing command: {str(e)}")]
+            return [TextContent(type="text", text=f"SSH error: {str(e)}")]
         except Exception as e:
-            return [TextContent(type="text", text=f"Failed to execute command: {str(e)}")]
+            return [TextContent(type="text", text=f"Execution failed: {str(e)}")]
 
     async def _ssh_read_file(self, args: Dict[str, Any]) -> List[TextContent]:
         """Read a remote file without modifying it."""
@@ -2085,145 +2287,14 @@ class SSHMCPServer:
             )]
 
         try:
-            connection = self._ensure_connection(plan.connection_name)
-        except (KeyError, RuntimeError) as e:
-            return [TextContent(type="text", text=str(e))]
-
-        connection.last_used = time.time()
-
-        try:
-            if plan.kind == PLAN_KIND_COMMAND:
-                stdout_text, stderr_text, exit_code = await self._exec_command(
-                    connection.client,
-                    plan.payload["command"],
-                    int(plan.payload.get("timeout", DEFAULT_COMMAND_TIMEOUT)),
-                )
-                plan.status = PLAN_STATUS_EXECUTED
-                plan.executed_at = time.time()
-                plan.verification = f"Command exit code {exit_code}"
-                self._save_plans()
-                self._audit_event("plan_executed", plan, extra={"exit_code": exit_code})
-                result = f"Plan '{plan_id}' executed.\nCommand: {plan.payload['command']}\nExit Code: {exit_code}\n"
-                if stdout_text:
-                    result += f"\nSTDOUT:\n{stdout_text}\n"
-                if stderr_text:
-                    result += f"\nSTDERR:\n{stderr_text}\n"
-                return [TextContent(type="text", text=result)]
-
-            if plan.kind == PLAN_KIND_FILE_EDIT:
-                remote_path = plan.payload["remote_path"]
-                backup_path = f"{remote_path}.ssh-mcp.bak.{int(time.time())}"
-                new_bytes = plan.payload["new_content"].encode("utf-8")
-                await self._write_remote_file_bytes(
-                    connection,
-                    remote_path,
-                    new_bytes,
-                    backup_path=backup_path,
-                )
-                written_bytes = await self._read_remote_file_bytes(connection, remote_path)
-                written_hash = hashlib.sha256(written_bytes).hexdigest()
-                expected_hash = plan.payload["new_sha256"]
-                if written_hash != expected_hash:
-                    raise RuntimeError(
-                        f"Post-write verification failed for {remote_path}: "
-                        f"expected {expected_hash}, got {written_hash}"
-                    )
-
-                plan.status = PLAN_STATUS_EXECUTED
-                plan.executed_at = time.time()
-                plan.verification = f"Verified SHA256 {written_hash}; backup at {backup_path}"
-                self._save_plans()
-                self._audit_event(
-                    "plan_executed",
-                    plan,
-                    extra={"sha256": written_hash, "backup_path": backup_path},
-                )
-                result = (
-                    f"Plan '{plan_id}' executed.\n"
-                    f"Remote path: {remote_path}\n"
-                    f"Backup path: {backup_path}\n"
-                    f"SHA256: {written_hash}"
-                )
-                return [TextContent(type="text", text=result)]
-
-            if plan.kind == PLAN_KIND_KEY_AUTH:
-                credential_name = str(plan.payload["credential_name"])
-                key_name = str(plan.payload["key_name"])
-                key_comment = str(plan.payload["key_comment"])
-                overwrite_saved_credential = bool(
-                    plan.payload.get("overwrite_saved_credential", False)
-                )
-                await self._bootstrap_key_auth(
-                    client=connection.client,
-                    hostname=connection.hostname,
-                    username=connection.username,
-                    port=connection.port,
-                    credential_name=credential_name,
-                    key_name=key_name,
-                    key_comment=key_comment,
-                    known_hosts_path=connection.known_hosts_path,
-                    overwrite_saved_credential=overwrite_saved_credential,
-                    jump_host=connection.jump_host,
-                )
-                plan.status = PLAN_STATUS_EXECUTED
-                plan.executed_at = time.time()
-                plan.verification = (
-                    f"Installed key auth and saved credential '{credential_name}'"
-                )
-                self._save_plans()
-                self._audit_event(
-                    "plan_executed",
-                    plan,
-                    extra={"credential_name": credential_name, "key_name": key_name},
-                )
-                result = (
-                    f"Plan '{plan_id}' executed.\n"
-                    f"Installed SSH public key on {connection.hostname}\n"
-                    f"Saved credential: {credential_name}\n"
-                    f"Key name: {key_name}"
-                )
-                return [TextContent(type="text", text=result)]
-
-            if plan.kind == PLAN_KIND_UPLOAD:
-                source_path = Path(str(plan.payload["local_path"]))
-                remote_path = str(plan.payload["remote_path"])
-
-                def upload_file() -> None:
-                    sftp = connection.client.open_sftp()
-                    try:
-                        sftp.put(str(source_path), remote_path)
-                    finally:
-                        sftp.close()
-
-                await self._run_blocking(upload_file)
-                remote_hash = await self._remote_file_sha256(connection, remote_path)
-                expected_hash = str(plan.payload["local_sha256"])
-                if remote_hash != expected_hash:
-                    raise RuntimeError(
-                        f"Post-upload verification failed for {remote_path}: "
-                        f"expected {expected_hash}, got {remote_hash}"
-                    )
-
-                plan.status = PLAN_STATUS_EXECUTED
-                plan.executed_at = time.time()
-                plan.verification = f"Verified SHA256 {remote_hash}"
-                self._save_plans()
-                self._audit_event(
-                    "plan_executed",
-                    plan,
-                    extra={"sha256": remote_hash, "remote_path": remote_path},
-                )
-                result = (
-                    f"Plan '{plan_id}' executed.\n"
-                    f"Uploaded: {source_path}\n"
-                    f"Remote path: {remote_path}\n"
-                    f"SHA256: {remote_hash}"
-                )
-                return [TextContent(type="text", text=result)]
-
-            return [TextContent(type="text", text=f"Unsupported plan kind: {plan.kind}")]
+            result = await self._execute_plan_instance(plan)
+            return [TextContent(type="text", text=result)]
         except paramiko.SSHException as e:
-            connection.connected = False
+            try:
+                connection = self._ensure_connection(plan.connection_name)
+                connection.connected = False
+            except (KeyError, RuntimeError):
+                pass
             return [TextContent(type="text", text=f"SSH error executing plan: {str(e)}")]
         except Exception as e:
             return [TextContent(type="text", text=f"Failed to execute plan: {str(e)}")]
@@ -2254,7 +2325,7 @@ class SSHMCPServer:
         plan = self._store_plan(
             kind=PLAN_KIND_UPLOAD,
             connection_name=connection_name,
-            approval_required=True,
+            approval_required=not self._auto_mode_enabled(),
             risk="high",
             operational_risk="contained / partial",
             approval_summary={
@@ -2275,10 +2346,21 @@ class SSHMCPServer:
                 "local_bytes": len(local_bytes),
             },
         )
-        message = self._format_plan(plan)
-        if plan.payload:
-            message += "\nPayload:\n" + json.dumps(plan.payload, indent=2, sort_keys=True)
-        return [TextContent(type="text", text=message)]
+        if plan.approval_required:
+            message = self._format_plan(plan)
+            if plan.payload:
+                message += "\nPayload:\n" + json.dumps(plan.payload, indent=2, sort_keys=True)
+            return [TextContent(type="text", text=message)]
+
+        self._auto_approve_plan(plan, "ssh_upload_file")
+        try:
+            result = await self._execute_plan_instance(plan)
+            return [TextContent(type="text", text=result)]
+        except paramiko.SSHException as e:
+            connection.connected = False
+            return [TextContent(type="text", text=f"SSH error executing auto-approved plan: {str(e)}")]
+        except Exception as e:
+            return [TextContent(type="text", text=f"Failed to execute auto-approved plan: {str(e)}")]
 
     async def _ssh_download_file(self, args: Dict[str, Any]) -> List[TextContent]:
         """Download file from remote server via SFTP."""

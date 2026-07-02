@@ -71,6 +71,27 @@ Windows example:
 }
 ```
 
+### `config.json` runtime behavior
+
+You can place a `config.json` file beside `ssh_mcp_server.py` to control whether
+plan approval is required for tools that normally create approval-backed plans
+automatically.
+
+```json
+{
+  "auto-mode": "disabled"
+}
+```
+
+Modes:
+
+- `disabled`: current behavior. `ssh_execute`, `ssh_upload_file`, and `ssh_setup_key_auth` create a plan and wait for approval when they would normally require one.
+- `enabled`: bypass the approval prompt. Those same tools auto-approve their internal plan and execute immediately.
+
+Tools that are explicitly plan-oriented, such as `ssh_plan_command` and
+`ssh_plan_edit`, still return a stored plan because they are manual review tools
+by design.
+
 ### Portable Launchers
 
 You can also point an MCP client at the included launcher for the matching OS:
