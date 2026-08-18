@@ -1,3 +1,5 @@
+[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/nqmn-adremote-mcp-badge.png)](https://mseep.ai/app/nqmn-adremote-mcp)
+
 # adremote-mcp
 
 MCP server for safe remote SSH operations with plan approval, audit log, and credential management.
